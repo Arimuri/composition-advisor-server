@@ -353,6 +353,46 @@ def species_presets(_: str = Depends(_basic_auth)) -> JSONResponse:
     )
 
 
+def _render_cf(name: str, fmt: str) -> bytes:
+    """Render a built-in cantus firmus preset to MIDI or MusicXML bytes."""
+    if name not in CF_PRESETS:
+        raise HTTPException(status_code=404, detail=f"Unknown preset {name!r}")
+    cf_part = CF_PRESETS[name].to_part(part_name="cantus_firmus")
+    score = m21.stream.Score()
+    score.insert(0, cf_part)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / f"cf.{fmt}"
+        if fmt == "mid":
+            score.write("midi", fp=path)
+        elif fmt == "musicxml":
+            score.write("musicxml", fp=path)
+        else:
+            raise HTTPException(status_code=400, detail="format must be mid or musicxml")
+        return path.read_bytes()
+
+
+@app.get("/cantus-firmus/{name}.mid")
+def cantus_firmus_mid(name: str, _: str = Depends(_basic_auth)) -> Response:
+    """Download a built-in cantus firmus as a Standard MIDI File."""
+    data = _render_cf(name, "mid")
+    return Response(
+        content=data,
+        media_type="audio/midi",
+        headers={"Content-Disposition": f'attachment; filename="{name}.mid"'},
+    )
+
+
+@app.get("/cantus-firmus/{name}.musicxml")
+def cantus_firmus_musicxml(name: str, _: str = Depends(_basic_auth)) -> Response:
+    """Return a built-in cantus firmus as MusicXML for browser-side rendering."""
+    data = _render_cf(name, "musicxml")
+    return Response(
+        content=data,
+        media_type="application/vnd.recordare.musicxml+xml",
+        headers={"Content-Disposition": f'inline; filename="{name}.musicxml"'},
+    )
+
+
 @app.post("/fix")
 async def fix_endpoint(
     files: Annotated[list[UploadFile], File(...)],
@@ -537,6 +577,17 @@ INDEX_HTML = r"""<!doctype html>
     </select>
   </label>
 
+  <div id="cf-preview" style="display:none; border:1px solid #cbd5e1; border-radius:6px; padding:0.6em; background:#fff; margin-bottom:0.8em;">
+    <div class="row" style="margin-bottom:0.4em;">
+      <strong id="cf-preview-name" style="flex:1"></strong>
+      <button type="button" id="cf-play" class="secondary">▶ 再生</button>
+      <button type="button" id="cf-stop" class="secondary" style="display:none">■ 停止</button>
+      <a id="cf-download" class="secondary" style="text-decoration:none; padding:0.55em 1.1em; background:#64748b; color:#fff; border-radius:4px; font-size:0.92em;" download>↓ MIDI</a>
+    </div>
+    <div id="cf-preview-host" style="min-height:120px;"></div>
+    <div id="cf-preview-meta" style="font-size:0.8em; color:#64748b; margin-top:0.4em;"></div>
+  </div>
+
   <div id="species-cf-dropzone" class="dropzone" data-target="species-cf" style="display:none">
     <div><strong>Cantus Firmus MIDI をドロップ</strong></div>
     <div class="hint">または クリック</div>
@@ -664,26 +715,125 @@ const speciesCfDz = bindDropzone('species-cf-dropzone', 'species-cf-input', 'spe
 const speciesCpDz = bindDropzone('species-cp-dropzone', 'species-cp-input', 'species-cp-list', false);
 
 // ---------- preset loader ----------
+let presetData = {};
 async function loadPresets() {
   try {
     const res = await fetch('/species-presets');
     if (!res.ok) return;
-    const data = await res.json();
+    presetData = await res.json();
     const sel = document.getElementById('species-preset');
-    for (const name of Object.keys(data)) {
+    for (const name of Object.keys(presetData)) {
       const opt = document.createElement('option');
       opt.value = name;
-      opt.textContent = name + ' (' + data[name].key + ')';
+      opt.textContent = name + ' (' + presetData[name].key + ')';
       sel.appendChild(opt);
     }
   } catch (err) { console.warn('preset load failed', err); }
 }
 loadPresets();
 
+// ---------- cantus firmus preview ----------
+let cfOsmd = null;
+async function showCfPreview(name) {
+  const preview = document.getElementById('cf-preview');
+  if (!name) {
+    preview.style.display = 'none';
+    return;
+  }
+  preview.style.display = '';
+  const meta = presetData[name];
+  document.getElementById('cf-preview-name').textContent = name + ' (' + meta.key + ')';
+  document.getElementById('cf-preview-meta').textContent =
+    meta.description + '  /  音: ' + meta.notes.join(' ');
+  document.getElementById('cf-download').href = '/cantus-firmus/' + encodeURIComponent(name) + '.mid';
+
+  // Fetch MusicXML and draw it.
+  try {
+    const res = await fetch('/cantus-firmus/' + encodeURIComponent(name) + '.musicxml');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const xml = await res.text();
+    const host = document.getElementById('cf-preview-host');
+    host.innerHTML = '';
+    if (!cfOsmd || cfOsmd._host !== host) {
+      cfOsmd = new opensheetmusicdisplay.OpenSheetMusicDisplay(host, {
+        autoResize: true, drawTitle: false, drawSubtitle: false, drawComposer: false,
+      });
+      cfOsmd._host = host;
+    }
+    await cfOsmd.load(xml);
+    cfOsmd.render();
+  } catch (err) {
+    document.getElementById('cf-preview-host').textContent = 'プレビュー失敗: ' + err.message;
+  }
+}
+
 document.getElementById('species-preset').addEventListener('change', (e) => {
-  const showUpload = !e.target.value;
-  document.getElementById('species-cf-dropzone').style.display = showUpload ? '' : 'none';
+  const val = e.target.value;
+  document.getElementById('species-cf-dropzone').style.display = val ? 'none' : '';
+  showCfPreview(val);
 });
+
+// ---------- WebAudio playback for cantus firmus preview ----------
+// Studio One pitch labelling: middle C = C3 = MIDI 60.
+const NOTE_BASE = { C:0, D:2, E:4, F:5, G:7, A:9, B:11 };
+function studioOneToMidi(name) {
+  const m = /^([A-Ga-g])([#b]?)(-?\d+)$/.exec(name.trim());
+  if (!m) return null;
+  let v = NOTE_BASE[m[1].toUpperCase()];
+  if (m[2] === '#') v += 1;
+  if (m[2] === 'b') v -= 1;
+  return v + (parseInt(m[3], 10) + 2) * 12;
+}
+function midiToFreq(midi) { return 440 * Math.pow(2, (midi - 69) / 12); }
+
+let audioCtx = null;
+let cfPlayback = null;
+function stopCfPlayback() {
+  if (cfPlayback) {
+    cfPlayback.forEach((node) => { try { node.stop(); } catch {} });
+    cfPlayback = null;
+  }
+  document.getElementById('cf-stop').style.display = 'none';
+  document.getElementById('cf-play').style.display = '';
+}
+function playCf(name) {
+  const meta = presetData[name];
+  if (!meta) return;
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  stopCfPlayback();
+
+  const beatDur = 0.6;  // seconds per quarter; whole note ~ 2.4s
+  const noteLen = beatDur * 4;
+  const now = audioCtx.currentTime + 0.05;
+  const created = [];
+  meta.notes.forEach((nm, i) => {
+    const midi = studioOneToMidi(nm);
+    if (midi == null) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.value = midiToFreq(midi);
+    osc.connect(gain).connect(audioCtx.destination);
+    const start = now + i * noteLen;
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(0.18, start + 0.02);
+    gain.gain.setValueAtTime(0.18, start + noteLen * 0.85);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + noteLen);
+    osc.start(start);
+    osc.stop(start + noteLen + 0.05);
+    created.push(osc);
+  });
+  cfPlayback = created;
+  document.getElementById('cf-stop').style.display = '';
+  document.getElementById('cf-play').style.display = 'none';
+  // Auto-stop after total length
+  setTimeout(stopCfPlayback, (meta.notes.length * noteLen + 0.5) * 1000);
+}
+document.getElementById('cf-play').addEventListener('click', () => {
+  const name = document.getElementById('species-preset').value;
+  if (name) playCf(name);
+});
+document.getElementById('cf-stop').addEventListener('click', stopCfPlayback);
 
 // ---------- OSMD renderer ----------
 let osmd = null;

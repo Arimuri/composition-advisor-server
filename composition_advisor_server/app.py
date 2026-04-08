@@ -136,6 +136,51 @@ def _resolve_key(m21_score: m21.stream.Score, key_arg: str | None) -> m21.key.Ke
     return parse_key(key_arg) if key_arg else detect_key(m21_score)
 
 
+def _attach_lyrics(m21_score: m21.stream.Score, key: m21.key.Key) -> None:
+    """Walk every note in the score and attach scale-degree + melodic-interval lyrics.
+
+    OSMD draws lyrics automatically beneath each note, so this gives us the
+    annotation overlay we want without any client-side coordinate hacks.
+    """
+    from composition_advisor.analyze.note_annotations import (
+        DEGREE_LABELS,
+        _label_interval,
+    )
+
+    tonic_pc = key.tonic.pitchClass if key is not None else None
+
+    for part in m21_score.parts:
+        prev_midi: int | None = None
+        for elem in part.flatten().notes:
+            try:
+                if isinstance(elem, m21.chord.Chord):
+                    midi = int(elem.bass().midi) if elem.pitches else None
+                else:
+                    midi = int(elem.pitch.midi)
+            except Exception:
+                continue
+            if midi is None:
+                continue
+            lines: list[str] = []
+            if tonic_pc is not None:
+                offset = (midi - tonic_pc) % 12
+                lines.append(DEGREE_LABELS[offset])
+            if prev_midi is not None:
+                # Replace +/- with arrow glyphs because music21's Lyric
+                # constructor treats a leading "-" as a syllabic hyphen
+                # and silently strips it.
+                label = _label_interval(midi - prev_midi)
+                label = label.replace("+", "↑").replace("-", "↓")
+                lines.append(label)
+            if lines:
+                lyrics = []
+                for i, t in enumerate(lines):
+                    ly = m21.note.Lyric(text=t, number=i + 1, applyRaw=True)
+                    lyrics.append(ly)
+                elem.lyrics = lyrics
+            prev_midi = midi
+
+
 import math
 
 
@@ -228,17 +273,22 @@ async def critique_endpoint(
 @app.post("/musicxml")
 async def musicxml_endpoint(
     files: Annotated[list[UploadFile], File(...)],
+    key: Annotated[str | None, Form()] = None,
     _: str = Depends(_basic_auth),
 ) -> Response:
     """Convert uploaded MIDI files into a single merged MusicXML.
 
-    Used by the browser-side OSMD renderer to draw the score.
+    Used by the browser-side OSMD renderer to draw the score. The notes are
+    annotated with scale-degree and melodic-interval lyrics so OSMD draws
+    them automatically beneath each note.
     """
     async with HEAVY_LOCK:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             saved = _save_uploads_to_tmp(files, tmp_dir)
             m21_score = load_midi_files([str(p) for p in saved])
+            detected_key = _resolve_key(m21_score, key)
+            _attach_lyrics(m21_score, detected_key)
             out = tmp_dir / "score.musicxml"
             m21_score.write("musicxml", fp=out)
             data = out.read_bytes()
@@ -326,6 +376,7 @@ async def _species_impl(
         result = AnalysisResult(metadata=internal.metadata, slices=slices, issues=issues)
         annotations = annotate_score(internal, key=detected_key)
 
+        _attach_lyrics(m21_score, detected_key)
         xml_path = tmp_dir / "score.musicxml"
         m21_score.write("musicxml", fp=xml_path)
         musicxml = xml_path.read_text()
@@ -870,14 +921,18 @@ document.getElementById('cf-play').addEventListener('click', () => {
 document.getElementById('cf-stop').addEventListener('click', stopCfPlayback);
 
 // ---------- OSMD renderer ----------
+// Note annotations(scale_degree + melodic interval)はサーバー側で
+// MusicXML の <lyric> として埋め込まれて来るので、OSMD が自動的に音符
+// の下に描いてくれる。クライアント側で SVG を弄る必要はない。
 let osmd = null;
-async function renderMusicXML(xml, issues, annotations) {
+async function renderMusicXML(xml, issues) {
   const host = document.getElementById('score-host');
   host.innerHTML = '';
   if (!xml) return;
   if (!osmd || osmd._host !== host) {
     osmd = new opensheetmusicdisplay.OpenSheetMusicDisplay(host, {
       autoResize: true, drawTitle: false, drawSubtitle: false, drawComposer: false,
+      drawLyrics: true,
     });
     osmd._host = host;
   }
@@ -885,98 +940,8 @@ async function renderMusicXML(xml, issues, annotations) {
     await osmd.load(xml);
     osmd.render();
     highlightIssues(issues);
-    if (annotations && annotations.length) overlayAnnotations(annotations);
   } catch (err) {
     host.textContent = '譜面の描画に失敗: ' + err.message;
-  }
-}
-
-// Walk every graphical note in render order, then attach annotations by
-// matching (partName, sequential note index within that part). The order
-// produced by composition_advisor.annotate_score is also "sorted by
-// start_beat per part", so the indices line up.
-function overlayAnnotations(annotations) {
-  if (!osmd) return;
-  const host = document.getElementById('score-host');
-  const svg = host.querySelector('svg');
-  if (!svg) return;
-  // Drop any previous overlay so re-renders don't stack labels.
-  svg.querySelectorAll('g.cadv-annot').forEach((g) => g.remove());
-
-  // Bucket annotations by part name -> ordered list (already in order).
-  const byPart = new Map();
-  annotations.forEach((a) => {
-    if (!byPart.has(a.part)) byPart.set(a.part, []);
-    byPart.get(a.part).push(a);
-  });
-  const partCursor = new Map();  // part -> next index to consume
-
-  const overlay = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-  overlay.setAttribute('class', 'cadv-annot');
-  svg.appendChild(overlay);
-
-  try {
-    const sheet = osmd.GraphicSheet || osmd.graphic;
-    if (!sheet || !sheet.MusicPages) return;
-    const SCALE = 10.0;  // OSMD page-space → SVG px (osmd default)
-    sheet.MusicPages.forEach((page) => {
-      page.MusicSystems.forEach((system) => {
-        system.StaffLines.forEach((staffLine) => {
-          // Try to figure out the partName for this staff line.
-          let partName = null;
-          try {
-            partName = staffLine.ParentStaff.ParentInstrument.Name
-                    || staffLine.ParentStaff.ParentInstrument.NameLabel.text;
-          } catch { /* ignore */ }
-          if (!partName || !byPart.has(partName)) return;
-          const list = byPart.get(partName);
-          let cursor = partCursor.get(partName) || 0;
-
-          staffLine.Measures.forEach((measure) => {
-            measure.staffEntries.forEach((entry) => {
-              entry.graphicalVoiceEntries.forEach((ve) => {
-                ve.notes.forEach((gnote) => {
-                  if (cursor >= list.length) return;
-                  const ann = list[cursor];
-                  cursor++;
-                  if (ann.scale_degree == null && ann.melodic_interval_label == null) return;
-                  const bbox = gnote.PositionAndShape;
-                  if (!bbox) return;
-                  const cx = (bbox.AbsolutePosition.x + bbox.Size.width / 2) * SCALE;
-                  // Place label below the staff line bottom
-                  const staffBottom = staffLine.PositionAndShape.AbsolutePosition.y * SCALE
-                                    + staffLine.PositionAndShape.Size.height * SCALE;
-                  const labelY = staffBottom + 14;
-                  const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-                  text.setAttribute('x', cx);
-                  text.setAttribute('y', labelY);
-                  text.setAttribute('text-anchor', 'middle');
-                  text.setAttribute('font-size', '10');
-                  text.setAttribute('fill', '#475569');
-                  text.setAttribute('font-family', '-apple-system, sans-serif');
-                  const top = ann.scale_degree || '';
-                  const bot = ann.melodic_interval_label || '';
-                  text.textContent = top;
-                  if (bot) {
-                    const tspan = document.createElementNS('http://www.w3.org/2000/svg', 'tspan');
-                    tspan.setAttribute('x', cx);
-                    tspan.setAttribute('dy', '11');
-                    tspan.setAttribute('font-size', '9');
-                    tspan.setAttribute('fill', '#94a3b8');
-                    tspan.textContent = bot;
-                    text.appendChild(tspan);
-                  }
-                  overlay.appendChild(text);
-                });
-              });
-            });
-          });
-          partCursor.set(partName, cursor);
-        });
-      });
-    });
-  } catch (err) {
-    console.warn('overlayAnnotations failed', err);
   }
 }
 
@@ -1095,7 +1060,7 @@ document.getElementById('general-form').addEventListener('submit', async (e) => 
       const fdXml = new FormData();
       for (const f of files) fdXml.append('files', f);
       const xmlRes = await fetch('/musicxml', { method: 'POST', body: fdXml });
-      if (xmlRes.ok) await renderMusicXML(await xmlRes.text(), data.issues, data.note_annotations);
+      if (xmlRes.ok) await renderMusicXML(await xmlRes.text(), data.issues);
       return;
     }
 
@@ -1144,7 +1109,7 @@ document.getElementById('species-form').addEventListener('submit', async (e) => 
     document.getElementById('output').textContent = JSON.stringify(data, null, 2);
     const result = data.result;
     renderIssues(result.issues);
-    if (data.musicxml) await renderMusicXML(data.musicxml, result.issues, data.note_annotations);
+    if (data.musicxml) await renderMusicXML(data.musicxml, result.issues);
     if (data.tutor_feedback) {
       document.getElementById('tutor').style.display = '';
       document.getElementById('tutor-heading').style.display = '';

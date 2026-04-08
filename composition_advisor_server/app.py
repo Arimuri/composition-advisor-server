@@ -16,6 +16,7 @@ useful for local development. In production set them via systemd.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -25,6 +26,15 @@ import tempfile
 import zipfile
 from pathlib import Path
 from typing import Annotated
+
+# Memory mitigation A: only one heavy chordify/species request at a time.
+# This bounds the resident-memory peak so the systemd MemoryMax limit is
+# not hit when multiple students poke the server simultaneously.
+HEAVY_LOCK = asyncio.Semaphore(int(os.environ.get("COMPOSITION_ADVISOR_CONCURRENCY", "1")))
+
+# Memory mitigation D: reject obviously oversized uploads before allocating
+# memory. Real counterpoint exercises are tiny (a few KB).
+MAX_UPLOAD_BYTES = int(os.environ.get("COMPOSITION_ADVISOR_MAX_UPLOAD", str(2 * 1024 * 1024)))
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -37,6 +47,7 @@ from composition_advisor.analyze.voice_extractor import extract_slices
 from composition_advisor.cli import _annotate_slice_degrees
 from composition_advisor.critique.config import load_config
 from composition_advisor.critique.runner import run_all as run_all_rules
+from composition_advisor.critique.species_runner import run_species
 from composition_advisor.fix.applier import apply_fixes_to_midi, write_diff_report
 from composition_advisor.fix.llm import propose as propose_llm_fixes
 from composition_advisor.fix.rule_based import propose as propose_rule_fixes
@@ -44,6 +55,8 @@ from composition_advisor.io.midi_loader import load_midi_files
 from composition_advisor.io.normalize import normalize_score
 from composition_advisor.llm.claude_client import critique as llm_critique
 from composition_advisor.model.issue import AnalysisResult
+from composition_advisor.tutor.cantus_firmus import PRESETS as CF_PRESETS, get as get_cf
+from composition_advisor.tutor.feedback_prompt import critique_species
 
 logger = logging.getLogger(__name__)
 app = FastAPI(title="composition-advisor-server", version="0.1.0")
@@ -81,7 +94,10 @@ def _basic_auth(
 
 
 def _save_uploads_to_tmp(files: list[UploadFile], dest: Path) -> list[Path]:
-    """Persist uploaded files to a temp directory and return their paths."""
+    """Persist uploaded files to a temp directory and return their paths.
+
+    Per-file size cap is enforced (default 2 MB) to keep memory bounded.
+    """
     saved: list[Path] = []
     for upload in files:
         if not upload.filename:
@@ -94,8 +110,21 @@ def _save_uploads_to_tmp(files: list[UploadFile], dest: Path) -> list[Path]:
                 detail=f"Only .mid / .midi files are accepted (got {name!r})",
             )
         out_path = dest / name
+        bytes_written = 0
         with out_path.open("wb") as fh:
-            shutil.copyfileobj(upload.file, fh)
+            while True:
+                chunk = upload.file.read(64 * 1024)
+                if not chunk:
+                    break
+                bytes_written += len(chunk)
+                if bytes_written > MAX_UPLOAD_BYTES:
+                    fh.close()
+                    out_path.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"{name!r} exceeds the {MAX_UPLOAD_BYTES} byte upload limit",
+                    )
+                fh.write(chunk)
         saved.append(out_path)
     if not saved:
         raise HTTPException(status_code=400, detail="No MIDI files uploaded")
@@ -128,22 +157,23 @@ def index(_: str = Depends(_basic_auth)) -> str:
 
 
 @app.post("/analyze")
-def analyze_endpoint(
+async def analyze_endpoint(
     files: Annotated[list[UploadFile], File(...)],
     key: Annotated[str | None, Form()] = None,
     _: str = Depends(_basic_auth),
 ) -> JSONResponse:
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_dir = Path(tmp)
-        saved = _save_uploads_to_tmp(files, tmp_dir)
-        m21_score = load_midi_files([str(p) for p in saved])
-        detected_key = _resolve_key(m21_score, key)
-        result = _build_result(m21_score, detected_key, None)
+    async with HEAVY_LOCK:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            saved = _save_uploads_to_tmp(files, tmp_dir)
+            m21_score = load_midi_files([str(p) for p in saved])
+            detected_key = _resolve_key(m21_score, key)
+            result = _build_result(m21_score, detected_key, None)
     return JSONResponse(content=result.model_dump())
 
 
 @app.post("/critique")
-def critique_endpoint(
+async def critique_endpoint(
     files: Annotated[list[UploadFile], File(...)],
     key: Annotated[str | None, Form()] = None,
     _: str = Depends(_basic_auth),
@@ -152,13 +182,14 @@ def critique_endpoint(
         raise HTTPException(
             status_code=503, detail="ANTHROPIC_API_KEY is not configured on the server"
         )
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_dir = Path(tmp)
-        saved = _save_uploads_to_tmp(files, tmp_dir)
-        m21_score = load_midi_files([str(p) for p in saved])
-        detected_key = _resolve_key(m21_score, key)
-        result = _build_result(m21_score, detected_key, None)
-        critique_text = llm_critique(result)
+    async with HEAVY_LOCK:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            saved = _save_uploads_to_tmp(files, tmp_dir)
+            m21_score = load_midi_files([str(p) for p in saved])
+            detected_key = _resolve_key(m21_score, key)
+            result = _build_result(m21_score, detected_key, None)
+            critique_text = llm_critique(result)
     return JSONResponse(
         content={
             "critique": critique_text,
@@ -168,13 +199,168 @@ def critique_endpoint(
     )
 
 
+@app.post("/musicxml")
+async def musicxml_endpoint(
+    files: Annotated[list[UploadFile], File(...)],
+    _: str = Depends(_basic_auth),
+) -> Response:
+    """Convert uploaded MIDI files into a single merged MusicXML.
+
+    Used by the browser-side OSMD renderer to draw the score.
+    """
+    async with HEAVY_LOCK:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            saved = _save_uploads_to_tmp(files, tmp_dir)
+            m21_score = load_midi_files([str(p) for p in saved])
+            out = tmp_dir / "score.musicxml"
+            m21_score.write("musicxml", fp=out)
+            data = out.read_bytes()
+    return Response(
+        content=data,
+        media_type="application/vnd.recordare.musicxml+xml",
+        headers={"Content-Disposition": 'inline; filename="score.musicxml"'},
+    )
+
+
+@app.post("/species")
+async def species_endpoint(
+    counterpoint: Annotated[UploadFile, File(...)],
+    cantus_firmus: Annotated[UploadFile | None, File()] = None,
+    preset: Annotated[str | None, Form()] = None,
+    species_num: Annotated[int, Form()] = 1,
+    key: Annotated[str | None, Form()] = None,
+    _: str = Depends(_basic_auth),
+) -> JSONResponse:
+    """Run Species Counterpoint analysis.
+
+    Provide either a `cantus_firmus` upload or a built-in `preset` name.
+    The response includes both the AnalysisResult and a base64-free
+    MusicXML payload for the OSMD renderer.
+    """
+    if cantus_firmus is None and not preset:
+        raise HTTPException(
+            status_code=400,
+            detail="Either cantus_firmus upload or preset name is required",
+        )
+    if cantus_firmus is not None and preset:
+        raise HTTPException(
+            status_code=400, detail="Provide either cantus_firmus or preset, not both"
+        )
+
+    async with HEAVY_LOCK:
+        return await _species_impl(counterpoint, cantus_firmus, preset, species_num, key)
+
+
+async def _species_impl(
+    counterpoint: UploadFile,
+    cantus_firmus: UploadFile | None,
+    preset: str | None,
+    species_num: int,
+    key: str | None,
+) -> JSONResponse:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        # Save counterpoint upload
+        cp_saved = _save_uploads_to_tmp([counterpoint], tmp_dir)[0]
+
+        if preset:
+            if preset not in CF_PRESETS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown preset {preset!r}. Available: {sorted(CF_PRESETS)}",
+                )
+            cf_part = get_cf(preset).to_part(part_name="cantus_firmus")
+            m21_score = m21.stream.Score()
+            m21_score.insert(0, cf_part)
+            cp_score = load_midi_files([str(cp_saved)])
+            for p in cp_score.parts:
+                p.partName = "counterpoint"
+                m21_score.insert(0, p)
+        else:
+            cf_saved = _save_uploads_to_tmp([cantus_firmus], tmp_dir)[0]
+            m21_score = load_midi_files([str(cf_saved), str(cp_saved)])
+            for idx, part in enumerate(m21_score.parts):
+                part.partName = "cantus_firmus" if idx == 0 else "counterpoint"
+
+        detected_key = parse_key(key) if key else detect_key(m21_score)
+        internal = normalize_score(m21_score, key=detected_key)
+        slices = extract_slices(internal)
+        _annotate_slice_degrees(slices, detected_key)
+
+        issues = run_species(
+            internal,
+            slices,
+            species=species_num,
+            params={
+                "cantus_firmus_part": "cantus_firmus",
+                "counterpoint_part": "counterpoint",
+            },
+        )
+        result = AnalysisResult(metadata=internal.metadata, slices=slices, issues=issues)
+
+        xml_path = tmp_dir / "score.musicxml"
+        m21_score.write("musicxml", fp=xml_path)
+        musicxml = xml_path.read_text()
+
+    return JSONResponse(
+        content={
+            "result": result.model_dump(),
+            "musicxml": musicxml,
+            "species": species_num,
+        }
+    )
+
+
+@app.post("/species-tutor")
+async def species_tutor_endpoint(
+    counterpoint: Annotated[UploadFile, File(...)],
+    cantus_firmus: Annotated[UploadFile | None, File()] = None,
+    preset: Annotated[str | None, Form()] = None,
+    species_num: Annotated[int, Form()] = 1,
+    key: Annotated[str | None, Form()] = None,
+    _: str = Depends(_basic_auth),
+) -> JSONResponse:
+    """Run species check + ask Claude tutor for feedback."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise HTTPException(
+            status_code=503, detail="ANTHROPIC_API_KEY is not configured on the server"
+        )
+    if cantus_firmus is None and not preset:
+        raise HTTPException(
+            status_code=400,
+            detail="Either cantus_firmus upload or preset name is required",
+        )
+
+    async with HEAVY_LOCK:
+        payload = await _species_impl(counterpoint, cantus_firmus, preset, species_num, key)
+        body = payload.body.decode()
+        import json as _json
+        data = _json.loads(body)
+        result = AnalysisResult.model_validate(data["result"])
+        feedback = critique_species(result, species=species_num)
+        data["tutor_feedback"] = feedback
+    return JSONResponse(content=data)
+
+
+@app.get("/species-presets")
+def species_presets(_: str = Depends(_basic_auth)) -> JSONResponse:
+    return JSONResponse(
+        content={
+            name: {"key": p.key, "description": p.description, "notes": p.notes}
+            for name, p in CF_PRESETS.items()
+        }
+    )
+
+
 @app.post("/fix")
-def fix_endpoint(
+async def fix_endpoint(
     files: Annotated[list[UploadFile], File(...)],
     key: Annotated[str | None, Form()] = None,
     use_llm: Annotated[bool, Form()] = False,
     _: str = Depends(_basic_auth),
 ) -> Response:
+  async with HEAVY_LOCK:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
         saved = _save_uploads_to_tmp(files, tmp_dir)
@@ -217,40 +403,44 @@ def fix_endpoint(
     )
 
 
-INDEX_HTML = """\
-<!doctype html>
+INDEX_HTML = r"""<!doctype html>
 <html lang="ja">
 <head>
 <meta charset="utf-8">
 <title>composition-advisor</title>
 <style>
-  body { font-family: -apple-system, sans-serif; max-width: 720px; margin: 2em auto; padding: 0 1em; }
-  h1 { font-size: 1.4em; }
-  form { border: 1px solid #ccc; padding: 1em 1.5em; border-radius: 6px; margin-bottom: 1.5em; }
-  label { display: block; margin: 0.6em 0; }
-  input[type="text"] { width: 100%; padding: 0.4em; box-sizing: border-box; }
-  button { padding: 0.6em 1.2em; background: #2563eb; color: white; border: 0; border-radius: 4px; cursor: pointer; font-size: 0.95em; }
+  body { font-family: -apple-system, "Hiragino Sans", sans-serif; max-width: 960px; margin: 1.5em auto; padding: 0 1em; color: #1f2937; }
+  h1 { font-size: 1.4em; margin-bottom: 0.2em; }
+  h2 { font-size: 1.05em; color: #475569; margin-top: 1.5em; }
+  .tabs { display: flex; gap: 0.4em; border-bottom: 1px solid #cbd5e1; margin-bottom: 1em; }
+  .tabs button { background: transparent; border: 0; padding: 0.6em 1em; cursor: pointer; color: #64748b; font-size: 0.95em; border-bottom: 3px solid transparent; }
+  .tabs button.active { color: #2563eb; border-bottom-color: #2563eb; font-weight: 600; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  form { border: 1px solid #cbd5e1; padding: 1em 1.5em; border-radius: 8px; margin-bottom: 1em; background: #fff; }
+  label { display: block; margin: 0.6em 0; font-size: 0.92em; }
+  input[type="text"], select { width: 100%; padding: 0.45em; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.95em; }
+  button { padding: 0.55em 1.1em; background: #2563eb; color: white; border: 0; border-radius: 4px; cursor: pointer; font-size: 0.92em; }
   button:hover { background: #1d4ed8; }
   button:disabled { background: #94a3b8; cursor: not-allowed; }
-  pre { background: #f4f4f4; padding: 1em; overflow-x: auto; max-height: 480px; }
+  button.secondary { background: #64748b; }
+  button.secondary:hover { background: #475569; }
+  pre { background: #f1f5f9; padding: 1em; overflow-x: auto; max-height: 400px; border-radius: 6px; font-size: 0.85em; }
   .row { display: flex; gap: 0.5em; align-items: center; flex-wrap: wrap; }
 
   .dropzone {
     border: 2px dashed #94a3b8;
     border-radius: 8px;
-    padding: 2em 1em;
+    padding: 1.5em 1em;
     text-align: center;
     color: #64748b;
     background: #f8fafc;
     cursor: pointer;
     transition: background 0.15s, border-color 0.15s;
   }
-  .dropzone.drag {
-    background: #dbeafe;
-    border-color: #2563eb;
-    color: #1d4ed8;
-  }
+  .dropzone.drag { background: #dbeafe; border-color: #2563eb; color: #1d4ed8; }
   .dropzone .hint { font-size: 0.85em; margin-top: 0.4em; color: #94a3b8; }
+
   .file-list { list-style: none; padding: 0; margin: 0.6em 0 0; font-size: 0.9em; }
   .file-list li {
     display: flex;
@@ -267,141 +457,429 @@ INDEX_HTML = """\
     padding: 0 0.4em;
     font-size: 1.1em;
   }
-  .file-list button:hover { background: transparent; color: #b91c1c; }
+
+  .issues { margin-top: 0.5em; }
+  .issue {
+    border-left: 3px solid #cbd5e1;
+    padding: 0.4em 0.8em;
+    margin-bottom: 0.4em;
+    background: #f8fafc;
+    border-radius: 0 4px 4px 0;
+    font-size: 0.88em;
+  }
+  .issue.warning { border-left-color: #f59e0b; }
+  .issue.error { border-left-color: #ef4444; }
+  .issue.info { border-left-color: #3b82f6; }
+  .issue .head { font-weight: 600; color: #1e293b; }
+  .issue .head .pos { color: #64748b; font-weight: 400; margin-left: 0.4em; font-family: ui-monospace, monospace; }
+
+  #score-host {
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    padding: 0.5em;
+    background: #fff;
+    min-height: 200px;
+    overflow-x: auto;
+  }
+  #score-host:empty::before {
+    content: "譜面はここに表示されます";
+    color: #94a3b8;
+    font-size: 0.85em;
+  }
+  .tutor-box { background: #fef3c7; border: 1px solid #fde68a; border-radius: 6px; padding: 1em; white-space: pre-wrap; font-size: 0.92em; line-height: 1.6; }
 </style>
 </head>
 <body>
 <h1>composition-advisor</h1>
 
-<form id="analyze" enctype="multipart/form-data">
-  <div id="dropzone" class="dropzone">
+<div class="tabs">
+  <button data-tab="general" class="active">一般分析</button>
+  <button data-tab="species">対位法レッスン</button>
+</div>
+
+<!-- ============ 一般分析 ============ -->
+<section id="panel-general" class="panel active">
+<form id="general-form" enctype="multipart/form-data">
+  <div id="general-dropzone" class="dropzone" data-target="general">
     <div><strong>MIDI ファイルをここにドラッグ&ドロップ</strong></div>
     <div class="hint">またはクリックして選択(.mid / .midi、複数可)</div>
-    <input id="file-input" type="file" name="files" multiple accept=".mid,.midi" hidden>
-    <ul id="file-list" class="file-list"></ul>
+    <input id="general-file-input" type="file" name="files" multiple accept=".mid,.midi" hidden>
+    <ul id="general-file-list" class="file-list"></ul>
   </div>
 
   <label>キー(省略時は自動推定)
     <input type="text" name="key" placeholder="C, Am, Bb …">
   </label>
   <div class="row">
-    <button type="submit" data-mode="analyze">分析(JSON)</button>
+    <button type="submit" data-mode="analyze">分析</button>
     <button type="submit" data-mode="critique">添削(Claude)</button>
     <button type="submit" data-mode="fix">修正MIDI</button>
   </div>
 </form>
+</section>
 
+<!-- ============ 対位法レッスン ============ -->
+<section id="panel-species" class="panel">
+<form id="species-form" enctype="multipart/form-data">
+  <label>Species
+    <select name="species_num">
+      <option value="1">Species 1 (1:1, note against note)</option>
+      <option value="2" disabled>Species 2 (2:1) — coming soon</option>
+      <option value="3" disabled>Species 3 (4:1) — coming soon</option>
+      <option value="4" disabled>Species 4 (suspension) — coming soon</option>
+      <option value="5" disabled>Species 5 (florid) — coming soon</option>
+    </select>
+  </label>
+
+  <label>Cantus firmus(プリセット or アップロード)
+    <select name="preset" id="species-preset">
+      <option value="">(アップロードする)</option>
+    </select>
+  </label>
+
+  <div id="species-cf-dropzone" class="dropzone" data-target="species-cf" style="display:none">
+    <div><strong>Cantus Firmus MIDI をドロップ</strong></div>
+    <div class="hint">または クリック</div>
+    <input id="species-cf-input" type="file" accept=".mid,.midi" hidden>
+    <ul id="species-cf-list" class="file-list"></ul>
+  </div>
+
+  <h2>Counterpoint(あなたの解答)</h2>
+  <div id="species-cp-dropzone" class="dropzone" data-target="species-cp">
+    <div><strong>Counterpoint MIDI をドロップ</strong></div>
+    <div class="hint">または クリック</div>
+    <input id="species-cp-input" type="file" accept=".mid,.midi" hidden>
+    <ul id="species-cp-list" class="file-list"></ul>
+  </div>
+
+  <label>キー(省略時は自動推定)
+    <input type="text" name="key" placeholder="C, Am, Bb …">
+  </label>
+
+  <div class="row">
+    <button type="submit" data-mode="species">チェック</button>
+    <button type="submit" data-mode="species-tutor">添削(Claude教師)</button>
+  </div>
+</form>
+</section>
+
+<h2>譜面</h2>
+<div id="score-host"></div>
+
+<h2>Issues</h2>
+<div id="issues" class="issues"></div>
+
+<h2 id="tutor-heading" style="display:none">対位法教師フィードバック</h2>
+<div id="tutor" class="tutor-box" style="display:none"></div>
+
+<h2>生レスポンス</h2>
 <pre id="output">結果がここに出ます</pre>
 
+<script src="https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.8.7/build/opensheetmusicdisplay.min.js"></script>
 <script>
-const form = document.getElementById('analyze');
-const out = document.getElementById('output');
-const dropzone = document.getElementById('dropzone');
-const fileInput = document.getElementById('file-input');
-const fileList = document.getElementById('file-list');
+// ---------- common helpers ----------
+function $(sel) { return document.querySelector(sel); }
 
-// In-memory list because DataTransfer.files cannot be mutated cross-browser.
-let selectedFiles = [];
+const tabs = document.querySelectorAll('.tabs button');
+const panels = document.querySelectorAll('.panel');
+tabs.forEach((t) => {
+  t.addEventListener('click', () => {
+    tabs.forEach((x) => x.classList.remove('active'));
+    panels.forEach((p) => p.classList.remove('active'));
+    t.classList.add('active');
+    document.getElementById('panel-' + t.dataset.tab).classList.add('active');
+  });
+});
 
-function refreshList() {
-  fileList.innerHTML = '';
-  selectedFiles.forEach((f, idx) => {
-    const li = document.createElement('li');
-    const span = document.createElement('span');
-    span.textContent = f.name + ' (' + Math.round(f.size / 1024) + ' KB)';
-    const rm = document.createElement('button');
-    rm.type = 'button';
-    rm.textContent = '×';
-    rm.title = '削除';
-    rm.addEventListener('click', (e) => {
-      e.stopPropagation();
-      selectedFiles.splice(idx, 1);
-      refreshList();
+// ---------- Multi-file dropzone factory ----------
+function bindDropzone(zoneId, inputId, listId, multiple) {
+  const zone = document.getElementById(zoneId);
+  const input = document.getElementById(inputId);
+  const list = document.getElementById(listId);
+  let files = [];
+
+  function refresh() {
+    list.innerHTML = '';
+    files.forEach((f, idx) => {
+      const li = document.createElement('li');
+      const span = document.createElement('span');
+      span.textContent = f.name + ' (' + Math.round(f.size / 1024) + ' KB)';
+      const rm = document.createElement('button');
+      rm.type = 'button';
+      rm.textContent = '×';
+      rm.title = '削除';
+      rm.addEventListener('click', (e) => {
+        e.stopPropagation();
+        files.splice(idx, 1);
+        refresh();
+      });
+      li.appendChild(span);
+      li.appendChild(rm);
+      list.appendChild(li);
     });
-    li.appendChild(span);
-    li.appendChild(rm);
-    fileList.appendChild(li);
-  });
-}
-
-function addFiles(files) {
-  for (const f of files) {
-    const lower = f.name.toLowerCase();
-    if (!lower.endsWith('.mid') && !lower.endsWith('.midi')) continue;
-    // Skip duplicates by name+size.
-    if (selectedFiles.some((x) => x.name === f.name && x.size === f.size)) continue;
-    selectedFiles.push(f);
   }
-  refreshList();
+  function add(newFiles) {
+    for (const f of newFiles) {
+      const lower = f.name.toLowerCase();
+      if (!lower.endsWith('.mid') && !lower.endsWith('.midi')) continue;
+      if (files.some((x) => x.name === f.name && x.size === f.size)) continue;
+      if (!multiple) files = [];
+      files.push(f);
+      if (!multiple) break;
+    }
+    refresh();
+  }
+  zone.addEventListener('click', (e) => {
+    if (e.target.tagName === 'BUTTON') return;
+    input.click();
+  });
+  input.addEventListener('change', () => add(input.files));
+  ['dragenter', 'dragover'].forEach((ev) => {
+    zone.addEventListener(ev, (e) => {
+      e.preventDefault(); e.stopPropagation();
+      zone.classList.add('drag');
+    });
+  });
+  ['dragleave', 'drop'].forEach((ev) => {
+    zone.addEventListener(ev, (e) => {
+      e.preventDefault(); e.stopPropagation();
+      zone.classList.remove('drag');
+    });
+  });
+  zone.addEventListener('drop', (e) => {
+    if (e.dataTransfer && e.dataTransfer.files) add(e.dataTransfer.files);
+  });
+  return {
+    files: () => files,
+    clear: () => { files = []; refresh(); },
+  };
 }
 
-dropzone.addEventListener('click', (e) => {
-  if (e.target.tagName === 'BUTTON') return;
-  fileInput.click();
-});
-fileInput.addEventListener('change', () => addFiles(fileInput.files));
-
-['dragenter', 'dragover'].forEach((ev) => {
-  dropzone.addEventListener(ev, (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    dropzone.classList.add('drag');
-  });
-});
-['dragleave', 'drop'].forEach((ev) => {
-  dropzone.addEventListener(ev, (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    dropzone.classList.remove('drag');
-  });
-});
-dropzone.addEventListener('drop', (e) => {
-  if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files);
-});
-
-// Prevent the browser from navigating away on accidental drops outside the zone.
 ['dragover', 'drop'].forEach((ev) => {
   window.addEventListener(ev, (e) => e.preventDefault());
 });
 
-form.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  if (selectedFiles.length === 0) {
-    out.textContent = 'MIDI ファイルを選んでください';
+const generalDz = bindDropzone('general-dropzone', 'general-file-input', 'general-file-list', true);
+const speciesCfDz = bindDropzone('species-cf-dropzone', 'species-cf-input', 'species-cf-list', false);
+const speciesCpDz = bindDropzone('species-cp-dropzone', 'species-cp-input', 'species-cp-list', false);
+
+// ---------- preset loader ----------
+async function loadPresets() {
+  try {
+    const res = await fetch('/species-presets');
+    if (!res.ok) return;
+    const data = await res.json();
+    const sel = document.getElementById('species-preset');
+    for (const name of Object.keys(data)) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name + ' (' + data[name].key + ')';
+      sel.appendChild(opt);
+    }
+  } catch (err) { console.warn('preset load failed', err); }
+}
+loadPresets();
+
+document.getElementById('species-preset').addEventListener('change', (e) => {
+  const showUpload = !e.target.value;
+  document.getElementById('species-cf-dropzone').style.display = showUpload ? '' : 'none';
+});
+
+// ---------- OSMD renderer ----------
+let osmd = null;
+async function renderMusicXML(xml, issues) {
+  const host = document.getElementById('score-host');
+  host.innerHTML = '';
+  if (!xml) return;
+  if (!osmd || osmd._host !== host) {
+    osmd = new opensheetmusicdisplay.OpenSheetMusicDisplay(host, {
+      autoResize: true, drawTitle: false, drawSubtitle: false, drawComposer: false,
+    });
+    osmd._host = host;
+  }
+  try {
+    await osmd.load(xml);
+    osmd.render();
+    highlightIssues(issues);
+  } catch (err) {
+    host.textContent = '譜面の描画に失敗: ' + err.message;
+  }
+}
+
+function highlightIssues(issues) {
+  if (!osmd || !issues) return;
+  // OSMD 1.x: traverse measures and color the first staff entry of bars
+  // that have issues. We don't try to pinpoint exact beats — too brittle.
+  const bars = new Map();
+  issues.forEach((iss) => {
+    const bucket = bars.get(iss.bar) || [];
+    bucket.push(iss);
+    bars.set(iss.bar, bucket);
+  });
+  try {
+    const sheet = osmd.Sheet;
+    const measureList = sheet && sheet.SourceMeasures;
+    if (!measureList) return;
+    measureList.forEach((measure) => {
+      const num = measure.MeasureNumber;
+      if (!bars.has(num)) return;
+      const issuesHere = bars.get(num);
+      const worst = issuesHere.reduce((acc, x) => {
+        const order = { info: 1, warning: 2, error: 3 };
+        return order[x.severity] > order[acc.severity] ? x : acc;
+      });
+      const color = worst.severity === 'error' ? '#ef4444'
+                  : worst.severity === 'warning' ? '#f59e0b'
+                  : '#3b82f6';
+      measure.VerticalSourceStaffEntryContainers.forEach((vsse) => {
+        vsse.StaffEntries.forEach((entry) => {
+          if (!entry) return;
+          entry.VoiceEntries.forEach((ve) => {
+            ve.Notes.forEach((note) => {
+              if (note && note.PrintObject !== false) {
+                note.NoteheadColor = color;
+              }
+            });
+          });
+        });
+      });
+    });
+    osmd.render();
+  } catch (err) { console.warn('highlight failed', err); }
+}
+
+// ---------- issue list renderer ----------
+function renderIssues(issues) {
+  const host = document.getElementById('issues');
+  host.innerHTML = '';
+  if (!issues || !issues.length) {
+    host.innerHTML = '<div class="issue info"><div class="head">問題なし</div></div>';
     return;
   }
+  issues.forEach((iss) => {
+    const div = document.createElement('div');
+    div.className = 'issue ' + iss.severity;
+    const head = document.createElement('div');
+    head.className = 'head';
+    head.textContent = iss.rule_id;
+    const pos = document.createElement('span');
+    pos.className = 'pos';
+    pos.textContent = ' bar' + iss.bar + ' beat' + Number(iss.beat_in_bar).toFixed(2);
+    head.appendChild(pos);
+    const desc = document.createElement('div');
+    desc.textContent = iss.description;
+    div.appendChild(head);
+    div.appendChild(desc);
+    host.appendChild(div);
+  });
+}
+
+// ---------- shared submit helper ----------
+async function postJSON(url, fd) {
+  const res = await fetch(url, { method: 'POST', body: fd });
+  const text = await res.text();
+  if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + text);
+  return JSON.parse(text);
+}
+
+function setBusy(form, busy) {
+  form.querySelectorAll('button[type="submit"]').forEach((b) => (b.disabled = busy));
+}
+
+// ---------- general form submit ----------
+document.getElementById('general-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const files = generalDz.files();
+  if (!files.length) { alert('MIDI ファイルを選んでください'); return; }
   const mode = e.submitter.dataset.mode;
+  const form = e.currentTarget;
   const fd = new FormData();
-  for (const f of selectedFiles) fd.append('files', f);
+  for (const f of files) fd.append('files', f);
   const key = form.elements['key'].value;
   if (key) fd.append('key', key);
 
-  out.textContent = '送信中…';
-  const buttons = form.querySelectorAll('button[type="submit"]');
-  buttons.forEach((b) => (b.disabled = true));
+  setBusy(form, true);
+  document.getElementById('output').textContent = '送信中…';
   try {
-    const res = await fetch('/' + mode, { method: 'POST', body: fd });
-    if (mode === 'fix' && res.ok) {
+    if (mode === 'fix') {
+      const res = await fetch('/fix', { method: 'POST', body: fd });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url;
-      a.download = 'fix_output.zip';
-      a.click();
-      out.textContent = 'fix_output.zip をダウンロードしました (' + res.headers.get('X-Fix-Count') + ' fixes)';
+      a.href = url; a.download = 'fix_output.zip'; a.click();
+      document.getElementById('output').textContent = 'fix_output.zip をダウンロードしました (' + res.headers.get('X-Fix-Count') + ' fixes)';
       return;
     }
-    const text = await res.text();
-    if (!res.ok) {
-      out.textContent = 'HTTP ' + res.status + '\\n' + text;
+
+    if (mode === 'analyze') {
+      // 1) get analysis JSON  2) get musicxml separately for rendering
+      const data = await postJSON('/analyze', fd);
+      document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+      renderIssues(data.issues);
+
+      const fdXml = new FormData();
+      for (const f of files) fdXml.append('files', f);
+      const xmlRes = await fetch('/musicxml', { method: 'POST', body: fdXml });
+      if (xmlRes.ok) await renderMusicXML(await xmlRes.text(), data.issues);
       return;
     }
-    try { out.textContent = JSON.stringify(JSON.parse(text), null, 2); }
-    catch { out.textContent = text; }
+
+    if (mode === 'critique') {
+      const data = await postJSON('/critique', fd);
+      document.getElementById('output').textContent = data.critique;
+      const tutor = document.getElementById('tutor');
+      const heading = document.getElementById('tutor-heading');
+      tutor.style.display = ''; heading.style.display = '';
+      tutor.textContent = data.critique;
+      return;
+    }
   } catch (err) {
-    out.textContent = 'エラー: ' + err.message;
+    document.getElementById('output').textContent = 'エラー: ' + err.message;
   } finally {
-    buttons.forEach((b) => (b.disabled = false));
+    setBusy(form, false);
+  }
+});
+
+// ---------- species form submit ----------
+document.getElementById('species-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.currentTarget;
+  const cpFiles = speciesCpDz.files();
+  if (!cpFiles.length) { alert('Counterpoint の MIDI を選んでください'); return; }
+  const presetVal = form.elements['preset'].value;
+  const cfFiles = speciesCfDz.files();
+  if (!presetVal && !cfFiles.length) { alert('Cantus firmus を選ぶか、プリセットを選んでください'); return; }
+
+  const mode = e.submitter.dataset.mode;  // 'species' or 'species-tutor'
+  const fd = new FormData();
+  fd.append('counterpoint', cpFiles[0]);
+  if (presetVal) fd.append('preset', presetVal);
+  else fd.append('cantus_firmus', cfFiles[0]);
+  fd.append('species_num', form.elements['species_num'].value);
+  const key = form.elements['key'].value;
+  if (key) fd.append('key', key);
+
+  setBusy(form, true);
+  document.getElementById('output').textContent = '送信中…(species check)';
+  document.getElementById('tutor').style.display = 'none';
+  document.getElementById('tutor-heading').style.display = 'none';
+
+  try {
+    const data = await postJSON('/' + mode, fd);
+    document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+    const result = data.result;
+    renderIssues(result.issues);
+    if (data.musicxml) await renderMusicXML(data.musicxml, result.issues);
+    if (data.tutor_feedback) {
+      document.getElementById('tutor').style.display = '';
+      document.getElementById('tutor-heading').style.display = '';
+      document.getElementById('tutor').textContent = data.tutor_feedback;
+    }
+  } catch (err) {
+    document.getElementById('output').textContent = 'エラー: ' + err.message;
+  } finally {
+    setBusy(form, false);
   }
 });
 </script>

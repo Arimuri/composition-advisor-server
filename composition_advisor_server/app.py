@@ -135,6 +135,27 @@ def _resolve_key(m21_score: m21.stream.Score, key_arg: str | None) -> m21.key.Ke
     return parse_key(key_arg) if key_arg else detect_key(m21_score)
 
 
+import math
+
+
+def _sanitize_for_json(obj):
+    """Recursively replace NaN/Infinity floats with None.
+
+    music21 occasionally produces NaN beat positions for empty measures or
+    odd time-signature contexts. starlette's JSONResponse delegates to the
+    standard json module which raises ValueError on non-finite floats.
+    """
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
+
+
 def _build_result(
     m21_score: m21.stream.Score, detected_key: m21.key.Key, config_path: Path | None
 ) -> AnalysisResult:
@@ -169,7 +190,7 @@ async def analyze_endpoint(
             m21_score = load_midi_files([str(p) for p in saved])
             detected_key = _resolve_key(m21_score, key)
             result = _build_result(m21_score, detected_key, None)
-    return JSONResponse(content=result.model_dump())
+    return JSONResponse(content=_sanitize_for_json(result.model_dump()))
 
 
 @app.post("/critique")
@@ -304,11 +325,11 @@ async def _species_impl(
         musicxml = xml_path.read_text()
 
     return JSONResponse(
-        content={
+        content=_sanitize_for_json({
             "result": result.model_dump(),
             "musicxml": musicxml,
             "species": species_num,
-        }
+        })
     )
 
 

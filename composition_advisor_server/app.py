@@ -489,6 +489,226 @@ def species_presets(_: str = Depends(_basic_auth)) -> JSONResponse:
     )
 
 
+# ----- species rule descriptions(教科書的説明) ---------------------------
+
+# 各 species のルールを「セクションごとの箇条書き」で持つ。UI 側はこれを
+# そのまま表示する。本体側のルール ID とは別に、人間が読みやすい順序と
+# 文言で書き下している(本体のルール名と1対1ではない場合あり)。
+
+_SPECIES_RULES_JA: dict[int, dict[str, list[dict[str, str]]]] = {
+    1: {
+        "label": "Species 1 (1:1, note against note)",
+        "summary": "定旋律1音に対して対旋律も1音(同じ長さ)。すべての音が同時に鳴り、不協和音は使えない。",
+        "sections": [
+            {
+                "heading": "開始と終止",
+                "items": [
+                    "最初の音と最後の音は完全協和音(完全1度・完全5度・完全8度)で鳴らす",
+                    "終止の直前は順次進行で目的音に到達するのが基本",
+                ],
+            },
+            {
+                "heading": "縦の音程(ハーモニック・インターバル)",
+                "items": [
+                    "すべての縦音程は協和音である必要がある(P1, m3, M3, P5, m6, M6, P8)",
+                    "不協和音(m2, M2, P4, TT, m7, M7)は禁止",
+                ],
+            },
+            {
+                "heading": "旋律の動き",
+                "items": [
+                    "オクターブを超える跳躍は禁止",
+                    "旋律的三全音(F→B など増4度・減5度の進行)は禁止",
+                    "4度より大きな跳躍の後は反対方向への順次進行で「埋め戻す」",
+                    "同方向への連続した跳躍は避ける",
+                ],
+            },
+            {
+                "heading": "旋律の形",
+                "items": [
+                    "クライマックス(最高音)は曲の中で1度だけ現れる",
+                    "全体の音域は10度以内に収める",
+                    "同じ高さの音を直接連打するのは禁止",
+                ],
+            },
+            {
+                "heading": "声部間の動き",
+                "items": [
+                    "平行5度・平行8度は禁止(2声部が同方向に動いて連続して完全音程を作る)",
+                    "隠伏5度・隠伏8度は注意(両声部が同方向に動いて完全音程に到達する)",
+                    "声部交叉(上声部が下声部より低くなる)は避ける",
+                ],
+            },
+        ],
+    },
+    2: {
+        "label": "Species 2 (2:1, half notes)",
+        "summary": "定旋律1音に対して対旋律は2音(各2分音符)。強拍は協和必須、弱拍は経過音なら不協和も可。",
+        "sections": [
+            {
+                "heading": "リズムと配置",
+                "items": [
+                    "1つの cantus 音に対して、対旋律は2分音符 × 2(強拍 + 弱拍)で書く",
+                    "開始は休符からでもよい(その場合の最初の音は弱拍)",
+                ],
+            },
+            {
+                "heading": "強拍(downbeat)",
+                "items": [
+                    "強拍(cantus と同時に鳴るタイミング)は必ず協和音にする",
+                    "禁則は1種と同じ(P1, m3, M3, P5, m6, M6, P8 のみ)",
+                ],
+            },
+            {
+                "heading": "弱拍(upbeat)",
+                "items": [
+                    "弱拍は協和音でも問題なし",
+                    "弱拍が不協和になる場合は「経過音(passing tone)」のみ許可",
+                    "経過音の条件: 直前の音から順次進行で接近し、直後の音にも同方向の順次進行で抜ける",
+                    "上記以外の不協和(刺繍音を弱拍に置く等)は禁止",
+                ],
+            },
+            {
+                "heading": "1種から引き継ぐルール",
+                "items": [
+                    "開始・終止は完全協和音",
+                    "平行5度・平行8度・声部交叉は禁止",
+                    "旋律的三全音禁止、跳躍の後は順次進行で解決",
+                    "クライマックスは1度だけ、音域10度以内",
+                ],
+            },
+        ],
+    },
+    3: {
+        "label": "Species 3 (4:1, quarter notes)",
+        "summary": "定旋律1音に対して対旋律は4音(各4分音符)。経過音と刺繍音(neighbor)が登場する。",
+        "sections": [
+            {
+                "heading": "リズムと配置",
+                "items": [
+                    "1つの cantus 音に対して、対旋律は4分音符 × 4 を書く",
+                    "拍位置: 1拍目(最強拍)→ 2拍目(弱拍)→ 3拍目(準強拍)→ 4拍目(弱拍)",
+                ],
+            },
+            {
+                "heading": "1拍目(downbeat)",
+                "items": [
+                    "1拍目は必ず協和音にする(警告)",
+                ],
+            },
+            {
+                "heading": "3拍目(secondary strong)",
+                "items": [
+                    "3拍目は原則として協和音(info)",
+                    "経過音または刺繍音として使う場合は許容",
+                ],
+            },
+            {
+                "heading": "2拍目・4拍目(weak)",
+                "items": [
+                    "経過音(stepwise approach + same-direction stepwise resolution)なら不協和も可",
+                    "刺繍音(neighbor: a → b → a の形、b は a から半音 or 全音)も可",
+                    "上記以外の不協和は避ける",
+                ],
+            },
+            {
+                "heading": "1種から引き継ぐルール",
+                "items": [
+                    "開始・終止は完全協和音",
+                    "平行5度・平行8度・声部交叉は禁止",
+                    "旋律的三全音禁止、跳躍の後は順次進行で解決",
+                ],
+            },
+        ],
+    },
+    4: {
+        "label": "Species 4 (suspension)",
+        "summary": "対旋律は2分音符だが、弱拍と次の強拍をタイで結ぶ。掛留(サスペンション)の不協和→解決を体感する種。",
+        "sections": [
+            {
+                "heading": "リズムと配置",
+                "items": [
+                    "対旋律は2分音符 × 2 だが、弱拍の音を次の小節の強拍にタイで持ち越す",
+                    "結果として強拍に「前の音」が新しい cantus 音とぶつかる構造になる",
+                ],
+            },
+            {
+                "heading": "掛留の3段階",
+                "items": [
+                    "1. 準備 (preparation): タイの始点(弱拍)では協和音である必要がある",
+                    "2. 衝突 (clash): タイの後半(次の強拍)では新 cantus 音に対して不協和になることが望ましい",
+                    "3. 解決 (resolution): 次の弱拍で必ず下行2度(半音 or 全音)で解決し、協和音に到達",
+                ],
+            },
+            {
+                "heading": "代表的な掛留",
+                "items": [
+                    "7-6 サスペンション: 7度の不協和 → 6度の協和",
+                    "4-3 サスペンション: 4度の不協和 → 3度の協和",
+                    "9-8 サスペンション: 9度(または2度)→ オクターブ",
+                ],
+            },
+            {
+                "heading": "禁則",
+                "items": [
+                    "解決が下行2度以外(同音 or 上行 or 跳躍)になるのは禁止",
+                    "解決音そのものが不協和なのは禁止",
+                    "準備が不協和なのは禁止",
+                ],
+            },
+            {
+                "heading": "1種から引き継ぐルール",
+                "items": [
+                    "開始・終止は完全協和音",
+                    "平行5度・平行8度・声部交叉は禁止",
+                    "旋律的三全音禁止",
+                ],
+            },
+        ],
+    },
+    5: {
+        "label": "Species 5 (florid counterpoint)",
+        "summary": "1〜4種を組み合わせて自由に書く華麗対位法。リズムは混在、掛留も使う。基礎ルールはすべて生きている。",
+        "sections": [
+            {
+                "heading": "リズムの自由度",
+                "items": [
+                    "全音符・2分音符・4分音符・タイを自由に混在させてよい",
+                    "ただし4音以上同じ音価が連続するのは単調になるので避ける",
+                    "曲中に少なくとも1つは持続音や掛留を入れて変化を作る",
+                ],
+            },
+            {
+                "heading": "1〜4種から引き継ぐすべてのルール",
+                "items": [
+                    "強拍は協和音(1種・2種)",
+                    "弱拍の不協和は経過音/刺繍音として(2種・3種)",
+                    "掛留は準備→衝突→下行2度解決(4種)",
+                    "開始・終止は完全協和音",
+                    "平行5度・平行8度・隠伏5/8度・声部交叉に注意",
+                    "旋律的三全音禁止、跳躍の後は順次進行で解決",
+                    "クライマックスは1度だけ、音域10度以内",
+                ],
+            },
+            {
+                "heading": "華麗対位法ならではの目標",
+                "items": [
+                    "リズムの変化で旋律に「呼吸」と「物語」を作る",
+                    "各拍ごとの細かい禁則よりも、全体としての歌いやすさを優先する",
+                    "掛留を効果的なポイントで使い、最も印象的な瞬間を作る",
+                ],
+            },
+        ],
+    },
+}
+
+
+@app.get("/species-rules")
+def species_rules(_: str = Depends(_basic_auth)) -> JSONResponse:
+    """Return the textbook rules for each species (Japanese)."""
+    return JSONResponse(content=_SPECIES_RULES_JA)
+
+
 def _render_cf(name: str, fmt: str) -> bytes:
     """Render a built-in cantus firmus preset to MIDI or MusicXML bytes."""
     if name not in CF_PRESETS:
@@ -698,7 +918,7 @@ INDEX_HTML = r"""<!doctype html>
 <section id="panel-species" class="panel">
 <form id="species-form" enctype="multipart/form-data">
   <label>Species
-    <select name="species_num">
+    <select name="species_num" id="species-num">
       <option value="1">Species 1 (1:1, note against note)</option>
       <option value="2">Species 2 (2:1, half notes)</option>
       <option value="3">Species 3 (4:1, quarter notes)</option>
@@ -706,6 +926,12 @@ INDEX_HTML = r"""<!doctype html>
       <option value="5">Species 5 (florid)</option>
     </select>
   </label>
+
+  <div id="species-rules-card" style="border:1px solid #cbd5e1; border-radius:6px; padding:0.8em 1em; background:#fffdf5; margin:0.6em 0 0.8em;">
+    <div style="font-weight:600; color:#475569; margin-bottom:0.3em;" id="species-rules-title">この種のルール</div>
+    <div style="font-size:0.85em; color:#64748b; margin-bottom:0.6em;" id="species-rules-summary"></div>
+    <div id="species-rules-body" style="font-size:0.85em; line-height:1.55;"></div>
+  </div>
 
   <label>Cantus firmus(プリセット or アップロード)
     <select name="preset" id="species-preset">
@@ -914,6 +1140,47 @@ document.getElementById('species-preset').addEventListener('change', (e) => {
   document.getElementById('species-cf-dropzone').style.display = val ? 'none' : '';
   showCfPreview(val);
 });
+
+// ---------- species rules card ----------
+let speciesRulesData = {};
+async function loadSpeciesRules() {
+  try {
+    const res = await fetch('/species-rules');
+    if (!res.ok) return;
+    speciesRulesData = await res.json();
+    renderSpeciesRules(document.getElementById('species-num').value);
+  } catch (err) { console.warn('species rules load failed', err); }
+}
+function renderSpeciesRules(speciesNum) {
+  const data = speciesRulesData[speciesNum];
+  if (!data) return;
+  document.getElementById('species-rules-title').textContent = data.label + ' のルール';
+  document.getElementById('species-rules-summary').textContent = data.summary || '';
+  const body = document.getElementById('species-rules-body');
+  body.innerHTML = '';
+  (data.sections || []).forEach((sec) => {
+    const h = document.createElement('div');
+    h.textContent = sec.heading;
+    h.style.fontWeight = '600';
+    h.style.color = '#1e293b';
+    h.style.marginTop = '0.5em';
+    body.appendChild(h);
+    const ul = document.createElement('ul');
+    ul.style.margin = '0.2em 0 0.4em 1.2em';
+    ul.style.padding = '0';
+    (sec.items || []).forEach((it) => {
+      const li = document.createElement('li');
+      li.textContent = it;
+      li.style.margin = '0.1em 0';
+      ul.appendChild(li);
+    });
+    body.appendChild(ul);
+  });
+}
+document.getElementById('species-num').addEventListener('change', (e) => {
+  renderSpeciesRules(e.target.value);
+});
+loadSpeciesRules();
 
 // ---------- WebAudio playback for cantus firmus preview ----------
 // Studio One pitch labelling: middle C = C3 = MIDI 60.

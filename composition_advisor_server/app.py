@@ -43,6 +43,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import music21 as m21
 
 from composition_advisor.analyze.key_detector import detect_key, parse_key
+from composition_advisor.analyze.note_annotations import annotate_score
 from composition_advisor.analyze.voice_extractor import extract_slices
 from composition_advisor.cli import _annotate_slice_degrees
 from composition_advisor.critique.config import load_config
@@ -158,13 +159,15 @@ def _sanitize_for_json(obj):
 
 def _build_result(
     m21_score: m21.stream.Score, detected_key: m21.key.Key, config_path: Path | None
-) -> AnalysisResult:
+) -> tuple[AnalysisResult, list]:
     cfg = load_config(config_path) if config_path else None
     internal = normalize_score(m21_score, key=detected_key)
     slices = extract_slices(internal)
     _annotate_slice_degrees(slices, detected_key)
     issues = run_all_rules(internal, slices, config=cfg)
-    return AnalysisResult(metadata=internal.metadata, slices=slices, issues=issues)
+    annotations = annotate_score(internal, key=detected_key)
+    result = AnalysisResult(metadata=internal.metadata, slices=slices, issues=issues)
+    return result, annotations
 
 
 @app.get("/healthz")
@@ -189,8 +192,10 @@ async def analyze_endpoint(
             saved = _save_uploads_to_tmp(files, tmp_dir)
             m21_score = load_midi_files([str(p) for p in saved])
             detected_key = _resolve_key(m21_score, key)
-            result = _build_result(m21_score, detected_key, None)
-    return JSONResponse(content=_sanitize_for_json(result.model_dump()))
+            result, annotations = _build_result(m21_score, detected_key, None)
+    payload = result.model_dump()
+    payload["note_annotations"] = [a.model_dump() for a in annotations]
+    return JSONResponse(content=_sanitize_for_json(payload))
 
 
 @app.post("/critique")
@@ -209,7 +214,7 @@ async def critique_endpoint(
             saved = _save_uploads_to_tmp(files, tmp_dir)
             m21_score = load_midi_files([str(p) for p in saved])
             detected_key = _resolve_key(m21_score, key)
-            result = _build_result(m21_score, detected_key, None)
+            result, _annotations = _build_result(m21_score, detected_key, None)
             critique_text = llm_critique(result)
     return JSONResponse(
         content={
@@ -319,6 +324,7 @@ async def _species_impl(
             },
         )
         result = AnalysisResult(metadata=internal.metadata, slices=slices, issues=issues)
+        annotations = annotate_score(internal, key=detected_key)
 
         xml_path = tmp_dir / "score.musicxml"
         m21_score.write("musicxml", fp=xml_path)
@@ -327,6 +333,7 @@ async def _species_impl(
     return JSONResponse(
         content=_sanitize_for_json({
             "result": result.model_dump(),
+            "note_annotations": [a.model_dump() for a in annotations],
             "musicxml": musicxml,
             "species": species_num,
         })
@@ -427,7 +434,7 @@ async def fix_endpoint(
         saved = _save_uploads_to_tmp(files, tmp_dir)
         m21_score = load_midi_files([str(p) for p in saved])
         detected_key = _resolve_key(m21_score, key)
-        result = _build_result(m21_score, detected_key, None)
+        result, _annotations = _build_result(m21_score, detected_key, None)
 
         fix_dir = tmp_dir / "fix_output"
         fixes = propose_rule_fixes(
@@ -864,7 +871,7 @@ document.getElementById('cf-stop').addEventListener('click', stopCfPlayback);
 
 // ---------- OSMD renderer ----------
 let osmd = null;
-async function renderMusicXML(xml, issues) {
+async function renderMusicXML(xml, issues, annotations) {
   const host = document.getElementById('score-host');
   host.innerHTML = '';
   if (!xml) return;
@@ -878,8 +885,98 @@ async function renderMusicXML(xml, issues) {
     await osmd.load(xml);
     osmd.render();
     highlightIssues(issues);
+    if (annotations && annotations.length) overlayAnnotations(annotations);
   } catch (err) {
     host.textContent = '譜面の描画に失敗: ' + err.message;
+  }
+}
+
+// Walk every graphical note in render order, then attach annotations by
+// matching (partName, sequential note index within that part). The order
+// produced by composition_advisor.annotate_score is also "sorted by
+// start_beat per part", so the indices line up.
+function overlayAnnotations(annotations) {
+  if (!osmd) return;
+  const host = document.getElementById('score-host');
+  const svg = host.querySelector('svg');
+  if (!svg) return;
+  // Drop any previous overlay so re-renders don't stack labels.
+  svg.querySelectorAll('g.cadv-annot').forEach((g) => g.remove());
+
+  // Bucket annotations by part name -> ordered list (already in order).
+  const byPart = new Map();
+  annotations.forEach((a) => {
+    if (!byPart.has(a.part)) byPart.set(a.part, []);
+    byPart.get(a.part).push(a);
+  });
+  const partCursor = new Map();  // part -> next index to consume
+
+  const overlay = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+  overlay.setAttribute('class', 'cadv-annot');
+  svg.appendChild(overlay);
+
+  try {
+    const sheet = osmd.GraphicSheet || osmd.graphic;
+    if (!sheet || !sheet.MusicPages) return;
+    const SCALE = 10.0;  // OSMD page-space → SVG px (osmd default)
+    sheet.MusicPages.forEach((page) => {
+      page.MusicSystems.forEach((system) => {
+        system.StaffLines.forEach((staffLine) => {
+          // Try to figure out the partName for this staff line.
+          let partName = null;
+          try {
+            partName = staffLine.ParentStaff.ParentInstrument.Name
+                    || staffLine.ParentStaff.ParentInstrument.NameLabel.text;
+          } catch { /* ignore */ }
+          if (!partName || !byPart.has(partName)) return;
+          const list = byPart.get(partName);
+          let cursor = partCursor.get(partName) || 0;
+
+          staffLine.Measures.forEach((measure) => {
+            measure.staffEntries.forEach((entry) => {
+              entry.graphicalVoiceEntries.forEach((ve) => {
+                ve.notes.forEach((gnote) => {
+                  if (cursor >= list.length) return;
+                  const ann = list[cursor];
+                  cursor++;
+                  if (ann.scale_degree == null && ann.melodic_interval_label == null) return;
+                  const bbox = gnote.PositionAndShape;
+                  if (!bbox) return;
+                  const cx = (bbox.AbsolutePosition.x + bbox.Size.width / 2) * SCALE;
+                  // Place label below the staff line bottom
+                  const staffBottom = staffLine.PositionAndShape.AbsolutePosition.y * SCALE
+                                    + staffLine.PositionAndShape.Size.height * SCALE;
+                  const labelY = staffBottom + 14;
+                  const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                  text.setAttribute('x', cx);
+                  text.setAttribute('y', labelY);
+                  text.setAttribute('text-anchor', 'middle');
+                  text.setAttribute('font-size', '10');
+                  text.setAttribute('fill', '#475569');
+                  text.setAttribute('font-family', '-apple-system, sans-serif');
+                  const top = ann.scale_degree || '';
+                  const bot = ann.melodic_interval_label || '';
+                  text.textContent = top;
+                  if (bot) {
+                    const tspan = document.createElementNS('http://www.w3.org/2000/svg', 'tspan');
+                    tspan.setAttribute('x', cx);
+                    tspan.setAttribute('dy', '11');
+                    tspan.setAttribute('font-size', '9');
+                    tspan.setAttribute('fill', '#94a3b8');
+                    tspan.textContent = bot;
+                    text.appendChild(tspan);
+                  }
+                  overlay.appendChild(text);
+                });
+              });
+            });
+          });
+          partCursor.set(partName, cursor);
+        });
+      });
+    });
+  } catch (err) {
+    console.warn('overlayAnnotations failed', err);
   }
 }
 
@@ -998,7 +1095,7 @@ document.getElementById('general-form').addEventListener('submit', async (e) => 
       const fdXml = new FormData();
       for (const f of files) fdXml.append('files', f);
       const xmlRes = await fetch('/musicxml', { method: 'POST', body: fdXml });
-      if (xmlRes.ok) await renderMusicXML(await xmlRes.text(), data.issues);
+      if (xmlRes.ok) await renderMusicXML(await xmlRes.text(), data.issues, data.note_annotations);
       return;
     }
 
@@ -1047,7 +1144,7 @@ document.getElementById('species-form').addEventListener('submit', async (e) => 
     document.getElementById('output').textContent = JSON.stringify(data, null, 2);
     const result = data.result;
     renderIssues(result.issues);
-    if (data.musicxml) await renderMusicXML(data.musicxml, result.issues);
+    if (data.musicxml) await renderMusicXML(data.musicxml, result.issues, data.note_annotations);
     if (data.tutor_feedback) {
       document.getElementById('tutor').style.display = '';
       document.getElementById('tutor-heading').style.display = '';

@@ -670,12 +670,18 @@ function bindDropzone(zoneId, inputId, listId, multiple) {
   const list = document.getElementById(listId);
   let files = [];
 
+  function fmtSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+  }
+
   function refresh() {
     list.innerHTML = '';
     files.forEach((f, idx) => {
       const li = document.createElement('li');
       const span = document.createElement('span');
-      span.textContent = f.name + ' (' + Math.round(f.size / 1024) + ' KB)';
+      span.textContent = f.name + ' (' + fmtSize(f.size) + ')';
       const rm = document.createElement('button');
       rm.type = 'button';
       rm.textContent = '×';

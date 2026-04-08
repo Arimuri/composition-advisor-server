@@ -228,20 +228,59 @@ INDEX_HTML = """\
   h1 { font-size: 1.4em; }
   form { border: 1px solid #ccc; padding: 1em 1.5em; border-radius: 6px; margin-bottom: 1.5em; }
   label { display: block; margin: 0.6em 0; }
-  input[type="text"], input[type="file"] { width: 100%; }
-  button { padding: 0.6em 1.2em; background: #2563eb; color: white; border: 0; border-radius: 4px; cursor: pointer; }
+  input[type="text"] { width: 100%; padding: 0.4em; box-sizing: border-box; }
+  button { padding: 0.6em 1.2em; background: #2563eb; color: white; border: 0; border-radius: 4px; cursor: pointer; font-size: 0.95em; }
   button:hover { background: #1d4ed8; }
+  button:disabled { background: #94a3b8; cursor: not-allowed; }
   pre { background: #f4f4f4; padding: 1em; overflow-x: auto; max-height: 480px; }
-  .row { display: flex; gap: 0.5em; align-items: center; }
+  .row { display: flex; gap: 0.5em; align-items: center; flex-wrap: wrap; }
+
+  .dropzone {
+    border: 2px dashed #94a3b8;
+    border-radius: 8px;
+    padding: 2em 1em;
+    text-align: center;
+    color: #64748b;
+    background: #f8fafc;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .dropzone.drag {
+    background: #dbeafe;
+    border-color: #2563eb;
+    color: #1d4ed8;
+  }
+  .dropzone .hint { font-size: 0.85em; margin-top: 0.4em; color: #94a3b8; }
+  .file-list { list-style: none; padding: 0; margin: 0.6em 0 0; font-size: 0.9em; }
+  .file-list li {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.3em 0.6em;
+    background: #eff6ff;
+    border-radius: 4px;
+    margin-bottom: 0.25em;
+  }
+  .file-list button {
+    background: transparent;
+    color: #ef4444;
+    padding: 0 0.4em;
+    font-size: 1.1em;
+  }
+  .file-list button:hover { background: transparent; color: #b91c1c; }
 </style>
 </head>
 <body>
 <h1>composition-advisor</h1>
 
 <form id="analyze" enctype="multipart/form-data">
-  <label>MIDI ファイル(複数選択可)
-    <input type="file" name="files" multiple accept=".mid,.midi" required>
-  </label>
+  <div id="dropzone" class="dropzone">
+    <div><strong>MIDI ファイルをここにドラッグ&ドロップ</strong></div>
+    <div class="hint">またはクリックして選択(.mid / .midi、複数可)</div>
+    <input id="file-input" type="file" name="files" multiple accept=".mid,.midi" hidden>
+    <ul id="file-list" class="file-list"></ul>
+  </div>
+
   <label>キー(省略時は自動推定)
     <input type="text" name="key" placeholder="C, Am, Bb …">
   </label>
@@ -257,18 +296,98 @@ INDEX_HTML = """\
 <script>
 const form = document.getElementById('analyze');
 const out = document.getElementById('output');
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('file-input');
+const fileList = document.getElementById('file-list');
+
+// In-memory list because DataTransfer.files cannot be mutated cross-browser.
+let selectedFiles = [];
+
+function refreshList() {
+  fileList.innerHTML = '';
+  selectedFiles.forEach((f, idx) => {
+    const li = document.createElement('li');
+    const span = document.createElement('span');
+    span.textContent = f.name + ' (' + Math.round(f.size / 1024) + ' KB)';
+    const rm = document.createElement('button');
+    rm.type = 'button';
+    rm.textContent = '×';
+    rm.title = '削除';
+    rm.addEventListener('click', (e) => {
+      e.stopPropagation();
+      selectedFiles.splice(idx, 1);
+      refreshList();
+    });
+    li.appendChild(span);
+    li.appendChild(rm);
+    fileList.appendChild(li);
+  });
+}
+
+function addFiles(files) {
+  for (const f of files) {
+    const lower = f.name.toLowerCase();
+    if (!lower.endsWith('.mid') && !lower.endsWith('.midi')) continue;
+    // Skip duplicates by name+size.
+    if (selectedFiles.some((x) => x.name === f.name && x.size === f.size)) continue;
+    selectedFiles.push(f);
+  }
+  refreshList();
+}
+
+dropzone.addEventListener('click', (e) => {
+  if (e.target.tagName === 'BUTTON') return;
+  fileInput.click();
+});
+fileInput.addEventListener('change', () => addFiles(fileInput.files));
+
+['dragenter', 'dragover'].forEach((ev) => {
+  dropzone.addEventListener(ev, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dropzone.classList.add('drag');
+  });
+});
+['dragleave', 'drop'].forEach((ev) => {
+  dropzone.addEventListener(ev, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dropzone.classList.remove('drag');
+  });
+});
+dropzone.addEventListener('drop', (e) => {
+  if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files);
+});
+
+// Prevent the browser from navigating away on accidental drops outside the zone.
+['dragover', 'drop'].forEach((ev) => {
+  window.addEventListener(ev, (e) => e.preventDefault());
+});
+
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (selectedFiles.length === 0) {
+    out.textContent = 'MIDI ファイルを選んでください';
+    return;
+  }
   const mode = e.submitter.dataset.mode;
-  const fd = new FormData(form);
+  const fd = new FormData();
+  for (const f of selectedFiles) fd.append('files', f);
+  const key = form.elements['key'].value;
+  if (key) fd.append('key', key);
+
   out.textContent = '送信中…';
+  const buttons = form.querySelectorAll('button[type="submit"]');
+  buttons.forEach((b) => (b.disabled = true));
   try {
     const res = await fetch('/' + mode, { method: 'POST', body: fd });
     if (mode === 'fix' && res.ok) {
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url; a.download = 'fix_output.zip'; a.click();
+      a.href = url;
+      a.download = 'fix_output.zip';
+      a.click();
       out.textContent = 'fix_output.zip をダウンロードしました (' + res.headers.get('X-Fix-Count') + ' fixes)';
       return;
     }
@@ -281,6 +400,8 @@ form.addEventListener('submit', async (e) => {
     catch { out.textContent = text; }
   } catch (err) {
     out.textContent = 'エラー: ' + err.message;
+  } finally {
+    buttons.forEach((b) => (b.disabled = false));
   }
 });
 </script>

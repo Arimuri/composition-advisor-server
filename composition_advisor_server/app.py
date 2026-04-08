@@ -136,21 +136,79 @@ def _resolve_key(m21_score: m21.stream.Score, key_arg: str | None) -> m21.key.Ke
     return parse_key(key_arg) if key_arg else detect_key(m21_score)
 
 
-def _attach_lyrics(m21_score: m21.stream.Score, key: m21.key.Key) -> None:
-    """Walk every note in the score and attach scale-degree + melodic-interval lyrics.
+_HARMONIC_LABELS = {
+    0: "P1",   # unison
+    1: "m2",
+    2: "M2",
+    3: "m3",
+    4: "M3",
+    5: "P4",
+    6: "TT",
+    7: "P5",
+    8: "m6",
+    9: "M6",
+    10: "m7",
+    11: "M7",
+}
 
-    OSMD draws lyrics automatically beneath each note, so this gives us the
-    annotation overlay we want without any client-side coordinate hacks.
+
+def _harmonic_interval_label(low_midi: int, high_midi: int) -> str:
+    """Return a textbook harmonic-interval label (e.g. 'P5', 'm3', 'M6')."""
+    diff = abs(high_midi - low_midi)
+    if diff == 0:
+        return "P1"
+    octaves = diff // 12
+    base = _HARMONIC_LABELS[diff % 12]
+    if octaves == 0:
+        return base
+    # Simple compound notation: P8 instead of P1+1oct
+    if diff == 12:
+        return "P8"
+    if diff % 12 == 0:
+        return f"P{octaves * 7 + 1}"  # 15, 22 ...
+    return f"{base}+{octaves}oct"
+
+
+def _attach_lyrics(m21_score: m21.stream.Score, key: m21.key.Key) -> None:
+    """Annotate each note with scale degree + harmonic interval against cf.
+
+    Layout:
+        line 1 — scale degree of THIS note relative to the song key
+                 (e.g. "3" for E in C major, "♯4" for F# in C major).
+        line 2 — counterpoint only: harmonic interval between this note
+                 and the cantus firmus note sounding at the same beat
+                 (e.g. "5", "3", "♭7"). Cantus firmus notes get no
+                 second line (it would just say "1" against itself).
+
+    Lyric text never starts with "-" so music21's syllabic-hyphen
+    handling does not silently strip characters.
     """
-    from composition_advisor.analyze.note_annotations import (
-        DEGREE_LABELS,
-        _label_interval,
-    )
+    from composition_advisor.analyze.note_annotations import DEGREE_LABELS
 
     tonic_pc = key.tonic.pitchClass if key is not None else None
+    EPS = 1e-3
+
+    # Find the cantus firmus part(s) for the score: any part whose name
+    # contains "cantus". If none is found, skip the harmonic-interval row.
+    cf_parts = [
+        p for p in m21_score.parts
+        if p.partName and "cantus" in p.partName.lower()
+    ]
+
+    def cf_midi_at(beat: float) -> int | None:
+        """Return the cantus midi sounding at the given absolute beat."""
+        for cp in cf_parts:
+            for note in cp.flatten().notes:
+                start = float(note.offset)
+                end = start + float(note.duration.quarterLength)
+                if start - EPS <= beat < end - EPS:
+                    if isinstance(note, m21.chord.Chord):
+                        return int(note.bass().midi)
+                    return int(note.pitch.midi)
+        return None
 
     for part in m21_score.parts:
-        prev_midi: int | None = None
+        is_cf = part in cf_parts
         for elem in part.flatten().notes:
             try:
                 if isinstance(elem, m21.chord.Chord):
@@ -161,24 +219,23 @@ def _attach_lyrics(m21_score: m21.stream.Score, key: m21.key.Key) -> None:
                 continue
             if midi is None:
                 continue
+
             lines: list[str] = []
             if tonic_pc is not None:
                 offset = (midi - tonic_pc) % 12
                 lines.append(DEGREE_LABELS[offset])
-            if prev_midi is not None:
-                # Replace +/- with arrow glyphs because music21's Lyric
-                # constructor treats a leading "-" as a syllabic hyphen
-                # and silently strips it.
-                label = _label_interval(midi - prev_midi)
-                label = label.replace("+", "↑").replace("-", "↓")
-                lines.append(label)
+
+            if not is_cf and cf_parts:
+                cf_midi = cf_midi_at(float(elem.offset))
+                if cf_midi is not None:
+                    lines.append(_harmonic_interval_label(cf_midi, midi))
+
             if lines:
                 lyrics = []
                 for i, t in enumerate(lines):
                     ly = m21.note.Lyric(text=t, number=i + 1, applyRaw=True)
                     lyrics.append(ly)
                 elem.lyrics = lyrics
-            prev_midi = midi
 
 
 import math

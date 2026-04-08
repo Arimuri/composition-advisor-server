@@ -524,10 +524,10 @@ INDEX_HTML = r"""<!doctype html>
   <label>Species
     <select name="species_num">
       <option value="1">Species 1 (1:1, note against note)</option>
-      <option value="2" disabled>Species 2 (2:1) — coming soon</option>
-      <option value="3" disabled>Species 3 (4:1) — coming soon</option>
-      <option value="4" disabled>Species 4 (suspension) — coming soon</option>
-      <option value="5" disabled>Species 5 (florid) — coming soon</option>
+      <option value="2">Species 2 (2:1, half notes)</option>
+      <option value="3">Species 3 (4:1, quarter notes)</option>
+      <option value="4">Species 4 (suspension)</option>
+      <option value="5">Species 5 (florid)</option>
     </select>
   </label>
 

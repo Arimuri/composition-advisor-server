@@ -58,6 +58,12 @@ from composition_advisor.llm.claude_client import critique as llm_critique
 from composition_advisor.model.issue import AnalysisResult
 from composition_advisor.tutor.cantus_firmus import PRESETS as CF_PRESETS, get as get_cf
 from composition_advisor.tutor.feedback_prompt import critique_species
+from composition_advisor.tutor.lesson_runner import (
+    build_lesson_system_prompt,
+    build_lesson_user_prompt,
+    run_lesson,
+)
+from composition_advisor.tutor.tracks import get_registry as get_track_registry
 
 logger = logging.getLogger(__name__)
 app = FastAPI(title="composition-advisor-server", version="0.1.0")
@@ -709,6 +715,155 @@ def species_rules(_: str = Depends(_basic_auth)) -> JSONResponse:
     return JSONResponse(content=_SPECIES_RULES_JA)
 
 
+# ----- learning tracks (Phase F + G) ---------------------------------------
+
+@app.get("/tracks")
+def list_tracks(_: str = Depends(_basic_auth)) -> JSONResponse:
+    """Return all learning tracks with their lesson summaries."""
+    registry = get_track_registry()
+    payload = {
+        "tracks": [
+            {
+                "id": t.id,
+                "title": t.title,
+                "summary": t.summary,
+                "lessons": [
+                    {
+                        "id": l.id,
+                        "title": l.title,
+                        "summary": l.summary,
+                        "expected_parts": l.expected_parts,
+                        "cantus_firmus_presets": l.cantus_firmus_presets,
+                        "species_compat": l.species_compat,
+                    }
+                    for l in t.lessons
+                ],
+            }
+            for t in registry.tracks.values()
+        ]
+    }
+    return JSONResponse(content=payload)
+
+
+@app.get("/tracks/{track_id}/lessons/{lesson_id}")
+def get_lesson(track_id: str, lesson_id: str, _: str = Depends(_basic_auth)) -> JSONResponse:
+    """Return one lesson's full definition (rules, persona, rule_card, references)."""
+    registry = get_track_registry()
+    lesson = registry.get_lesson(track_id, lesson_id)
+    if lesson is None:
+        raise HTTPException(status_code=404, detail=f"Unknown lesson {track_id}/{lesson_id}")
+    return JSONResponse(content=lesson.model_dump())
+
+
+@app.post("/lesson")
+async def lesson_endpoint(
+    track_id: Annotated[str, Form(...)],
+    lesson_id: Annotated[str, Form(...)],
+    counterpoint: Annotated[UploadFile, File(...)],
+    cantus_firmus: Annotated[UploadFile | None, File()] = None,
+    preset: Annotated[str | None, Form()] = None,
+    key: Annotated[str | None, Form()] = None,
+    use_llm: Annotated[bool, Form()] = False,
+    _: str = Depends(_basic_auth),
+) -> JSONResponse:
+    """Run a lesson against the uploaded score."""
+    registry = get_track_registry()
+    lesson = registry.get_lesson(track_id, lesson_id)
+    if lesson is None:
+        raise HTTPException(status_code=404, detail=f"Unknown lesson {track_id}/{lesson_id}")
+
+    # 2-part lessons (cantus firmus + counterpoint) accept either an uploaded
+    # cf or one of the built-in presets, like /species. Multi-voice lessons
+    # (3声/4声) require all the parts to be uploaded as a single MIDI file
+    # passed in `counterpoint`(命名は雑だがここでは「main upload」という意味)。
+    is_two_part = "cantus_firmus" in lesson.expected_parts
+    async with HEAVY_LOCK:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            cp_saved = _save_uploads_to_tmp([counterpoint], tmp_dir)[0]
+
+            if is_two_part:
+                if cantus_firmus is None and not preset:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="このレッスンは cantus firmus が必要です(プリセットかアップロード)。",
+                    )
+                if preset:
+                    if preset not in CF_PRESETS:
+                        raise HTTPException(status_code=400, detail=f"Unknown preset {preset!r}")
+                    cf_part = get_cf(preset).to_part(part_name="cantus_firmus")
+                    m21_score = m21.stream.Score()
+                    m21_score.insert(0, cf_part)
+                    cp_score = load_midi_files([str(cp_saved)])
+                    for p in cp_score.parts:
+                        p.partName = "counterpoint"
+                        m21_score.insert(0, p)
+                else:
+                    cf_saved = _save_uploads_to_tmp([cantus_firmus], tmp_dir)[0]
+                    m21_score = load_midi_files([str(cf_saved), str(cp_saved)])
+                    for idx, part in enumerate(m21_score.parts):
+                        part.partName = "cantus_firmus" if idx == 0 else "counterpoint"
+            else:
+                # Multi-voice lessons: take the uploaded MIDI as-is.
+                m21_score = load_midi_files([str(cp_saved)])
+                # If the lesson expects specific part names, rename in order.
+                if lesson.expected_parts:
+                    for idx, part in enumerate(m21_score.parts):
+                        if idx < len(lesson.expected_parts):
+                            part.partName = lesson.expected_parts[idx]
+
+            detected_key = parse_key(key) if key else detect_key(m21_score)
+            internal = normalize_score(m21_score, key=detected_key)
+            slices = extract_slices(internal)
+            _annotate_slice_degrees(slices, detected_key)
+
+            params = {}
+            if is_two_part:
+                params = {
+                    "cantus_firmus_part": "cantus_firmus",
+                    "counterpoint_part": "counterpoint",
+                }
+            issues = run_lesson(lesson, internal, slices, params=params)
+            result = AnalysisResult(metadata=internal.metadata, slices=slices, issues=issues)
+            annotations = annotate_score(internal, key=detected_key)
+
+            _attach_lyrics(m21_score, detected_key)
+            xml_path = tmp_dir / "score.musicxml"
+            m21_score.write("musicxml", fp=xml_path)
+            musicxml = xml_path.read_text()
+
+            tutor_feedback = None
+            if use_llm:
+                if not os.environ.get("ANTHROPIC_API_KEY"):
+                    raise HTTPException(
+                        status_code=503, detail="ANTHROPIC_API_KEY が設定されていません"
+                    )
+                # Build a lesson-specific Claude system prompt + base user prompt.
+                from composition_advisor.llm.prompt_builder import build_user_prompt
+                import anthropic as _anthropic
+                base_prompt = build_user_prompt(result)
+                user_prompt = build_lesson_user_prompt(lesson, base_prompt)
+                system_prompt = build_lesson_system_prompt(lesson)
+                client = _anthropic.Anthropic()
+                resp = client.messages.create(
+                    model="claude-opus-4-6",
+                    max_tokens=4000,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}],
+                )
+                tutor_feedback = "\n".join(b.text for b in resp.content if hasattr(b, "text"))
+
+    return JSONResponse(
+        content=_sanitize_for_json({
+            "lesson": lesson.model_dump(),
+            "result": result.model_dump(),
+            "note_annotations": [a.model_dump() for a in annotations],
+            "musicxml": musicxml,
+            "tutor_feedback": tutor_feedback,
+        })
+    )
+
+
 def _render_cf(name: str, fmt: str) -> bytes:
     """Render a built-in cantus firmus preset to MIDI or MusicXML bytes."""
     if name not in CF_PRESETS:
@@ -891,6 +1046,7 @@ INDEX_HTML = r"""<!doctype html>
 <div class="tabs">
   <button data-tab="general" class="active">一般分析</button>
   <button data-tab="species">対位法レッスン</button>
+  <button data-tab="lesson">学習トラック</button>
 </div>
 
 <!-- ============ 一般分析 ============ -->
@@ -972,6 +1128,56 @@ INDEX_HTML = r"""<!doctype html>
   <div class="row">
     <button type="submit" data-mode="species">チェック</button>
     <button type="submit" data-mode="species-tutor">添削(Claude教師)</button>
+  </div>
+</form>
+</section>
+
+<!-- ============ 学習トラック ============ -->
+<section id="panel-lesson" class="panel">
+<form id="lesson-form" enctype="multipart/form-data">
+  <label>トラック
+    <select name="track_id" id="lesson-track"></select>
+  </label>
+  <label>レッスン
+    <select name="lesson_id" id="lesson-pick"></select>
+  </label>
+
+  <div id="lesson-meta" style="border:1px solid #cbd5e1; border-radius:6px; padding:0.8em 1em; background:#fffdf5; margin:0.6em 0;">
+    <div style="font-weight:600; color:#475569;" id="lesson-title-display"></div>
+    <div style="font-size:0.85em; color:#64748b; margin-top:0.3em;" id="lesson-summary-display"></div>
+    <div style="font-size:0.8em; color:#94a3b8; margin-top:0.3em;" id="lesson-intent-display"></div>
+    <div id="lesson-rule-card" style="font-size:0.85em; line-height:1.55; margin-top:0.5em;"></div>
+    <div id="lesson-references" style="font-size:0.78em; color:#94a3b8; margin-top:0.5em;"></div>
+  </div>
+
+  <label id="lesson-cf-row">Cantus firmus(プリセット or アップロード)
+    <select name="preset" id="lesson-preset">
+      <option value="">(アップロードする)</option>
+    </select>
+  </label>
+
+  <div id="lesson-cf-dropzone" class="dropzone" data-target="lesson-cf" style="display:none">
+    <div><strong>Cantus Firmus MIDI をドロップ</strong></div>
+    <div class="hint">または クリック</div>
+    <input id="lesson-cf-input" type="file" accept=".mid,.midi" hidden>
+    <ul id="lesson-cf-list" class="file-list"></ul>
+  </div>
+
+  <h2 id="lesson-cp-heading">提出する MIDI</h2>
+  <div id="lesson-cp-dropzone" class="dropzone" data-target="lesson-cp">
+    <div><strong>MIDI をドロップ</strong></div>
+    <div class="hint">または クリック(複数声部のレッスンでは全声部を1ファイルに)</div>
+    <input id="lesson-cp-input" type="file" accept=".mid,.midi" hidden>
+    <ul id="lesson-cp-list" class="file-list"></ul>
+  </div>
+
+  <label>キー(省略時は自動推定)
+    <input type="text" name="key" placeholder="C, Am, Bb …">
+  </label>
+
+  <div class="row">
+    <button type="submit" data-mode="check">チェック</button>
+    <button type="submit" data-mode="check-llm">チェック + Claude添削</button>
   </div>
 </form>
 </section>
@@ -1081,6 +1287,8 @@ function bindDropzone(zoneId, inputId, listId, multiple) {
 const generalDz = bindDropzone('general-dropzone', 'general-file-input', 'general-file-list', true);
 const speciesCfDz = bindDropzone('species-cf-dropzone', 'species-cf-input', 'species-cf-list', false);
 const speciesCpDz = bindDropzone('species-cp-dropzone', 'species-cp-input', 'species-cp-list', false);
+const lessonCfDz = bindDropzone('lesson-cf-dropzone', 'lesson-cf-input', 'lesson-cf-list', false);
+const lessonCpDz = bindDropzone('lesson-cp-dropzone', 'lesson-cp-input', 'lesson-cp-list', false);
 
 // ---------- preset loader ----------
 let presetData = {};
@@ -1396,6 +1604,162 @@ document.getElementById('general-form').addEventListener('submit', async (e) => 
       tutor.style.display = ''; heading.style.display = '';
       tutor.textContent = data.critique;
       return;
+    }
+  } catch (err) {
+    document.getElementById('output').textContent = 'エラー: ' + err.message;
+  } finally {
+    setBusy(form, false);
+  }
+});
+
+// ---------- learning tracks tab ----------
+let tracksData = null;
+async function loadTracks() {
+  try {
+    const res = await fetch('/tracks');
+    if (!res.ok) return;
+    tracksData = await res.json();
+    const trackSel = document.getElementById('lesson-track');
+    trackSel.innerHTML = '';
+    tracksData.tracks.forEach((t) => {
+      const opt = document.createElement('option');
+      opt.value = t.id;
+      opt.textContent = t.title;
+      trackSel.appendChild(opt);
+    });
+    trackSel.dispatchEvent(new Event('change'));
+  } catch (err) { console.warn('tracks load failed', err); }
+}
+loadTracks();
+
+document.getElementById('lesson-track').addEventListener('change', (e) => {
+  const track = tracksData?.tracks?.find((t) => t.id === e.target.value);
+  if (!track) return;
+  const lessonSel = document.getElementById('lesson-pick');
+  lessonSel.innerHTML = '';
+  track.lessons.forEach((l) => {
+    const opt = document.createElement('option');
+    opt.value = l.id;
+    opt.textContent = l.title;
+    lessonSel.appendChild(opt);
+  });
+  lessonSel.dispatchEvent(new Event('change'));
+});
+
+document.getElementById('lesson-pick').addEventListener('change', async (e) => {
+  const trackId = document.getElementById('lesson-track').value;
+  const lessonId = e.target.value;
+  if (!trackId || !lessonId) return;
+  try {
+    const res = await fetch('/tracks/' + encodeURIComponent(trackId) + '/lessons/' + encodeURIComponent(lessonId));
+    if (!res.ok) return;
+    const lesson = await res.json();
+
+    document.getElementById('lesson-title-display').textContent = lesson.title;
+    document.getElementById('lesson-summary-display').textContent = lesson.summary || '';
+    document.getElementById('lesson-intent-display').textContent = lesson.intent || '';
+
+    const card = document.getElementById('lesson-rule-card');
+    card.innerHTML = '';
+    (lesson.rule_card || []).forEach((sec) => {
+      const h = document.createElement('div');
+      h.textContent = sec.heading;
+      h.style.fontWeight = '600';
+      h.style.color = '#1e293b';
+      h.style.marginTop = '0.4em';
+      card.appendChild(h);
+      const ul = document.createElement('ul');
+      ul.style.margin = '0.2em 0 0 1.2em';
+      (sec.items || []).forEach((it) => {
+        const li = document.createElement('li');
+        li.textContent = it;
+        ul.appendChild(li);
+      });
+      card.appendChild(ul);
+    });
+
+    const refsHost = document.getElementById('lesson-references');
+    if (lesson.references && lesson.references.length) {
+      refsHost.innerHTML = '参考: ' + lesson.references.map((r) => '<span style="margin-right:0.6em;">' + r + '</span>').join('');
+    } else {
+      refsHost.innerHTML = '';
+    }
+
+    // Cantus firmus row だけは 2 声レッスンの時に表示
+    const isTwoPart = (lesson.expected_parts || []).includes('cantus_firmus');
+    document.getElementById('lesson-cf-row').style.display = isTwoPart ? '' : 'none';
+    document.getElementById('lesson-cf-dropzone').style.display = isTwoPart && !document.getElementById('lesson-preset').value ? '' : 'none';
+
+    // Cantus preset 一覧をレッスン推奨で絞る
+    const presetSel = document.getElementById('lesson-preset');
+    presetSel.innerHTML = '';
+    if (isTwoPart) {
+      const empty = document.createElement('option');
+      empty.value = '';
+      empty.textContent = '(アップロードする)';
+      presetSel.appendChild(empty);
+      (lesson.cantus_firmus_presets || []).forEach((name) => {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        presetSel.appendChild(opt);
+      });
+    }
+
+    // Heading の文言だけ調整(複数声部レッスンでは "Counterpoint" 表記を消す)
+    document.getElementById('lesson-cp-heading').textContent = isTwoPart ? 'Counterpoint(あなたの解答)' : '提出する MIDI(全声部を1ファイルに)';
+  } catch (err) { console.warn('lesson load failed', err); }
+});
+
+document.getElementById('lesson-preset').addEventListener('change', (e) => {
+  const isUpload = !e.target.value;
+  document.getElementById('lesson-cf-dropzone').style.display = isUpload ? '' : 'none';
+});
+
+document.getElementById('lesson-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.currentTarget;
+  const cpFiles = lessonCpDz.files();
+  if (!cpFiles.length) { alert('提出する MIDI を選んでください'); return; }
+
+  const trackId = form.elements['track_id'].value;
+  const lessonId = form.elements['lesson_id'].value;
+  const presetVal = form.elements['preset'].value;
+  const cfFiles = lessonCfDz.files();
+  const isCfRowVisible = document.getElementById('lesson-cf-row').style.display !== 'none';
+
+  if (isCfRowVisible && !presetVal && !cfFiles.length) {
+    alert('Cantus firmus を選ぶか、プリセットを選んでください');
+    return;
+  }
+
+  const fd = new FormData();
+  fd.append('track_id', trackId);
+  fd.append('lesson_id', lessonId);
+  fd.append('counterpoint', cpFiles[0]);
+  if (isCfRowVisible) {
+    if (presetVal) fd.append('preset', presetVal);
+    else if (cfFiles.length) fd.append('cantus_firmus', cfFiles[0]);
+  }
+  const key = form.elements['key'].value;
+  if (key) fd.append('key', key);
+  if (e.submitter.dataset.mode === 'check-llm') fd.append('use_llm', 'true');
+
+  setBusy(form, true);
+  document.getElementById('output').textContent = '送信中…(lesson check)';
+  document.getElementById('tutor').style.display = 'none';
+  document.getElementById('tutor-heading').style.display = 'none';
+
+  try {
+    const data = await postJSON('/lesson', fd);
+    document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+    const result = data.result;
+    renderIssues(result.issues);
+    if (data.musicxml) await renderMusicXML(data.musicxml, result.issues);
+    if (data.tutor_feedback) {
+      document.getElementById('tutor').style.display = '';
+      document.getElementById('tutor-heading').style.display = '';
+      document.getElementById('tutor').textContent = data.tutor_feedback;
     }
   } catch (err) {
     document.getElementById('output').textContent = 'エラー: ' + err.message;

@@ -185,7 +185,7 @@ wheels = [
 [[package]]
 name = "composition-advisor"
 version = "0.1.0"
-source = { git = "https://github.com/Arimuri/ITBS_TAMANEGI-SENSEI.git?subdirectory=composition_advisor#fc811101f4f6928c20346014050b2ce98bf6998f" }
+source = { git = "https://github.com/Arimuri/ITBS_TAMANEGI-SENSEI.git?subdirectory=composition_advisor#84e082966844db2e05e4112b1b765f9640eec31d" }
 dependencies = [
     { name = "anthropic" },
     { name = "mido" },

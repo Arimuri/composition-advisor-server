@@ -1037,7 +1037,12 @@ INDEX_HTML = r"""<!doctype html>
     color: #94a3b8;
     font-size: 0.85em;
   }
-  .tutor-box { background: #fef3c7; border: 1px solid #fde68a; border-radius: 6px; padding: 1em; white-space: pre-wrap; font-size: 0.92em; line-height: 1.6; }
+  .tutor-box { background: #fef3c7; border: 1px solid #fde68a; border-radius: 6px; padding: 1em; font-size: 0.92em; line-height: 1.6; }
+  .tutor-box h1, .tutor-box h2, .tutor-box h3 { margin: 0.8em 0 0.3em; font-size: 1.05em; color: #92400e; }
+  .tutor-box ul, .tutor-box ol { margin: 0.3em 0 0.3em 1.4em; }
+  .tutor-box table { border-collapse: collapse; margin: 0.5em 0; font-size: 0.9em; }
+  .tutor-box th, .tutor-box td { border: 1px solid #d97706; padding: 0.25em 0.5em; }
+  .tutor-box code { background: #fef9c3; padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.9em; }
 </style>
 </head>
 <body>
@@ -1100,7 +1105,7 @@ INDEX_HTML = r"""<!doctype html>
       <strong id="cf-preview-name" style="flex:1"></strong>
       <button type="button" id="cf-play" class="secondary">▶ 再生</button>
       <button type="button" id="cf-stop" class="secondary" style="display:none">■ 停止</button>
-      <a id="cf-download" class="secondary" style="text-decoration:none; padding:0.55em 1.1em; background:#64748b; color:#fff; border-radius:4px; font-size:0.92em;" download>↓ MIDI</a>
+      <button type="button" id="cf-download" class="secondary">↓ MIDI</button>
     </div>
     <div id="cf-preview-host" style="min-height:120px;"></div>
     <div id="cf-preview-meta" style="font-size:0.8em; color:#64748b; margin-top:0.4em;"></div>
@@ -1182,7 +1187,7 @@ INDEX_HTML = r"""<!doctype html>
 </form>
 </section>
 
-<h2>譜面</h2>
+<h2>譜面 <button type="button" id="score-play" class="secondary" style="font-size:0.85em; margin-left:0.5em;" disabled>▶ 再生</button><button type="button" id="score-stop" class="secondary" style="font-size:0.85em; margin-left:0.3em; display:none;">■ 停止</button></h2>
 <div id="score-host"></div>
 
 <h2>Issues</h2>
@@ -1195,6 +1200,7 @@ INDEX_HTML = r"""<!doctype html>
 <pre id="output">結果がここに出ます</pre>
 
 <script src="https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.8.7/build/opensheetmusicdisplay.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@15.0.7/lib/marked.umd.min.js"></script>
 <script>
 // ---------- common helpers ----------
 function $(sel) { return document.querySelector(sel); }
@@ -1321,7 +1327,7 @@ async function showCfPreview(name) {
   document.getElementById('cf-preview-name').textContent = name + ' (' + meta.key + ')';
   document.getElementById('cf-preview-meta').textContent =
     meta.description + '  /  音: ' + meta.notes.join(' ');
-  document.getElementById('cf-download').href = '/cantus-firmus/' + encodeURIComponent(name) + '.mid';
+  document.getElementById('cf-download').dataset.cfName = name;
 
   // Fetch MusicXML and draw it.
   try {
@@ -1452,6 +1458,24 @@ document.getElementById('cf-play').addEventListener('click', () => {
 });
 document.getElementById('cf-stop').addEventListener('click', stopCfPlayback);
 
+document.getElementById('cf-download').addEventListener('click', async () => {
+  const name = document.getElementById('cf-download').dataset.cfName;
+  if (!name) return;
+  try {
+    const res = await fetch('/cantus-firmus/' + encodeURIComponent(name) + '.mid');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name + '.mid';
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    alert('MIDI のダウンロードに失敗: ' + err.message);
+  }
+});
+
 // ---------- OSMD renderer ----------
 // Note annotations(scale_degree + melodic interval)はサーバー側で
 // MusicXML の <lyric> として埋め込まれて来るので、OSMD が自動的に音符
@@ -1545,6 +1569,60 @@ function renderIssues(issues) {
   });
 }
 
+// ---------- score playback (WebAudio from note_annotations) ----------
+let scorePlayback = null;
+let lastAnnotations = null;
+
+function enableScorePlayback(annotations) {
+  lastAnnotations = annotations;
+  const btn = document.getElementById('score-play');
+  btn.disabled = !(annotations && annotations.length);
+}
+function stopScorePlayback() {
+  if (scorePlayback) {
+    scorePlayback.forEach((n) => { try { n.stop(); } catch {} });
+    scorePlayback = null;
+  }
+  document.getElementById('score-stop').style.display = 'none';
+  document.getElementById('score-play').style.display = '';
+}
+function playScore() {
+  if (!lastAnnotations || !lastAnnotations.length) return;
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  stopScorePlayback();
+
+  const beatDur = 0.5;  // seconds per quarter note (BPM 120)
+  const now = audioCtx.currentTime + 0.05;
+  const created = [];
+  // Group by part for distinct timbres (slight detune).
+  const parts = [...new Set(lastAnnotations.map((a) => a.part))];
+  lastAnnotations.forEach((a) => {
+    if (a.pitch == null || a.start_beat == null) return;
+    const dur = (a.duration || 4.0) * beatDur;
+    const start = now + (a.start_beat || 0) * beatDur;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    const partIdx = parts.indexOf(a.part);
+    osc.type = partIdx === 0 ? 'triangle' : (partIdx === 1 ? 'sine' : 'square');
+    osc.frequency.value = midiToFreq(a.pitch);
+    osc.connect(gain).connect(audioCtx.destination);
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(0.12, start + 0.02);
+    gain.gain.setValueAtTime(0.12, start + dur * 0.85);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+    osc.start(start);
+    osc.stop(start + dur + 0.05);
+    created.push(osc);
+  });
+  scorePlayback = created;
+  document.getElementById('score-stop').style.display = '';
+  document.getElementById('score-play').style.display = 'none';
+  const maxEnd = Math.max(...lastAnnotations.map((a) => ((a.start_beat || 0) + (a.duration || 4)) * beatDur));
+  setTimeout(stopScorePlayback, (maxEnd + 1) * 1000);
+}
+document.getElementById('score-play').addEventListener('click', playScore);
+document.getElementById('score-stop').addEventListener('click', stopScorePlayback);
+
 // ---------- shared submit helper ----------
 async function postJSON(url, fd) {
   const res = await fetch(url, { method: 'POST', body: fd });
@@ -1588,9 +1666,11 @@ document.getElementById('general-form').addEventListener('submit', async (e) => 
       const data = await postJSON('/analyze', fd);
       document.getElementById('output').textContent = JSON.stringify(data, null, 2);
       renderIssues(data.issues);
+      enableScorePlayback(data.note_annotations);
 
       const fdXml = new FormData();
       for (const f of files) fdXml.append('files', f);
+      fdXml.append('key', form.elements['key'].value || '');
       const xmlRes = await fetch('/musicxml', { method: 'POST', body: fdXml });
       if (xmlRes.ok) await renderMusicXML(await xmlRes.text(), data.issues);
       return;
@@ -1602,7 +1682,7 @@ document.getElementById('general-form').addEventListener('submit', async (e) => 
       const tutor = document.getElementById('tutor');
       const heading = document.getElementById('tutor-heading');
       tutor.style.display = ''; heading.style.display = '';
-      tutor.textContent = data.critique;
+      tutor.innerHTML = (typeof marked !== 'undefined' && marked.parse) ? marked.parse(data.critique) : data.critique;
       return;
     }
   } catch (err) {
@@ -1755,11 +1835,12 @@ document.getElementById('lesson-form').addEventListener('submit', async (e) => {
     document.getElementById('output').textContent = JSON.stringify(data, null, 2);
     const result = data.result;
     renderIssues(result.issues);
+    enableScorePlayback(data.note_annotations);
     if (data.musicxml) await renderMusicXML(data.musicxml, result.issues);
     if (data.tutor_feedback) {
       document.getElementById('tutor').style.display = '';
       document.getElementById('tutor-heading').style.display = '';
-      document.getElementById('tutor').textContent = data.tutor_feedback;
+      document.getElementById('tutor').innerHTML = (typeof marked !== 'undefined' && marked.parse) ? marked.parse(data.tutor_feedback) : data.tutor_feedback;
     }
   } catch (err) {
     document.getElementById('output').textContent = 'エラー: ' + err.message;
@@ -1797,11 +1878,12 @@ document.getElementById('species-form').addEventListener('submit', async (e) => 
     document.getElementById('output').textContent = JSON.stringify(data, null, 2);
     const result = data.result;
     renderIssues(result.issues);
+    enableScorePlayback(data.note_annotations);
     if (data.musicxml) await renderMusicXML(data.musicxml, result.issues);
     if (data.tutor_feedback) {
       document.getElementById('tutor').style.display = '';
       document.getElementById('tutor-heading').style.display = '';
-      document.getElementById('tutor').textContent = data.tutor_feedback;
+      document.getElementById('tutor').innerHTML = (typeof marked !== 'undefined' && marked.parse) ? marked.parse(data.tutor_feedback) : data.tutor_feedback;
     }
   } catch (err) {
     document.getElementById('output').textContent = 'エラー: ' + err.message;

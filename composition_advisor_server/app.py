@@ -43,6 +43,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import music21 as m21
 
 from composition_advisor.analyze.key_detector import detect_key, parse_key
+from composition_advisor.io.transpose import apply_transpose, parse_transpose_string
 from composition_advisor.analyze.note_annotations import annotate_score
 from composition_advisor.analyze.voice_extractor import extract_slices
 from composition_advisor.cli import _annotate_slice_degrees
@@ -266,10 +267,13 @@ def _sanitize_for_json(obj):
 
 
 def _build_result(
-    m21_score: m21.stream.Score, detected_key: m21.key.Key, config_path: Path | None
+    m21_score: m21.stream.Score, detected_key: m21.key.Key, config_path: Path | None,
+    transpose_offsets: dict[str, int] | None = None,
 ) -> tuple[AnalysisResult, list]:
     cfg = load_config(config_path) if config_path else None
     internal = normalize_score(m21_score, key=detected_key)
+    if transpose_offsets:
+        apply_transpose(internal, transpose_offsets)
     slices = extract_slices(internal)
     _annotate_slice_degrees(slices, detected_key)
     issues = run_all_rules(internal, slices, config=cfg)
@@ -292,15 +296,17 @@ def index(_: str = Depends(_basic_auth)) -> str:
 async def analyze_endpoint(
     files: Annotated[list[UploadFile], File(...)],
     key: Annotated[str | None, Form()] = None,
+    transpose: Annotated[str | None, Form()] = None,
     _: str = Depends(_basic_auth),
 ) -> JSONResponse:
+    offsets = parse_transpose_string(transpose or "")
     async with HEAVY_LOCK:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             saved = _save_uploads_to_tmp(files, tmp_dir)
             m21_score = load_midi_files([str(p) for p in saved])
             detected_key = _resolve_key(m21_score, key)
-            result, annotations = _build_result(m21_score, detected_key, None)
+            result, annotations = _build_result(m21_score, detected_key, None, transpose_offsets=offsets)
     payload = result.model_dump()
     payload["note_annotations"] = [a.model_dump() for a in annotations]
     return JSONResponse(content=_sanitize_for_json(payload))
@@ -310,19 +316,21 @@ async def analyze_endpoint(
 async def critique_endpoint(
     files: Annotated[list[UploadFile], File(...)],
     key: Annotated[str | None, Form()] = None,
+    transpose: Annotated[str | None, Form()] = None,
     _: str = Depends(_basic_auth),
 ) -> JSONResponse:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise HTTPException(
             status_code=503, detail="ANTHROPIC_API_KEY is not configured on the server"
         )
+    offsets = parse_transpose_string(transpose or "")
     async with HEAVY_LOCK:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             saved = _save_uploads_to_tmp(files, tmp_dir)
             m21_score = load_midi_files([str(p) for p in saved])
             detected_key = _resolve_key(m21_score, key)
-            result, _annotations = _build_result(m21_score, detected_key, None)
+            result, _annotations = _build_result(m21_score, detected_key, None, transpose_offsets=offsets)
             critique_text = llm_critique(result)
     return JSONResponse(
         content={
@@ -1229,25 +1237,58 @@ function bindDropzone(zoneId, inputId, listId, multiple) {
     return (bytes / 1024 / 1024).toFixed(1) + ' MB';
   }
 
+  // Per-file octave offset for transpose correction.
+  const offsets = {};
+
   function refresh() {
     list.innerHTML = '';
     files.forEach((f, idx) => {
       const li = document.createElement('li');
       const span = document.createElement('span');
       span.textContent = f.name + ' (' + fmtSize(f.size) + ')';
+
+      const sel = document.createElement('select');
+      sel.title = 'オクターブ補正';
+      sel.style.cssText = 'margin-left:0.5em; font-size:0.85em; padding:0.1em;';
+      [-3,-2,-1,0,1,2,3].forEach((v) => {
+        const opt = document.createElement('option');
+        opt.value = v;
+        opt.textContent = v === 0 ? '±0' : (v > 0 ? '+' + v : '' + v) + 'oct';
+        if (v === (offsets[f.name] || 0)) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      sel.addEventListener('change', (e) => {
+        offsets[f.name] = parseInt(e.target.value, 10);
+      });
+
       const rm = document.createElement('button');
       rm.type = 'button';
       rm.textContent = '×';
       rm.title = '削除';
       rm.addEventListener('click', (e) => {
         e.stopPropagation();
+        delete offsets[f.name];
         files.splice(idx, 1);
         refresh();
       });
       li.appendChild(span);
+      li.appendChild(sel);
       li.appendChild(rm);
       list.appendChild(li);
     });
+  }
+
+  function getTransposeString() {
+    // Build "partname:semitones,..." from file offsets.
+    const parts = [];
+    files.forEach((f) => {
+      const oct = offsets[f.name] || 0;
+      if (oct === 0) return;
+      // Use file stem (without .mid) as part name.
+      const stem = f.name.replace(/\.(mid|midi)$/i, '');
+      parts.push(stem + ':' + (oct * 12));
+    });
+    return parts.join(',');
   }
   function add(newFiles) {
     for (const f of newFiles) {
@@ -1283,6 +1324,7 @@ function bindDropzone(zoneId, inputId, listId, multiple) {
   return {
     files: () => files,
     clear: () => { files = []; refresh(); },
+    getTransposeString: getTransposeString,
   };
 }
 
@@ -1663,6 +1705,8 @@ document.getElementById('general-form').addEventListener('submit', async (e) => 
   for (const f of files) fd.append('files', f);
   const key = form.elements['key'].value;
   if (key) fd.append('key', key);
+  const transposeStr = generalDz.getTransposeString();
+  if (transposeStr) fd.append('transpose', transposeStr);
 
   setBusy(form, true);
   startProgress('送信中');

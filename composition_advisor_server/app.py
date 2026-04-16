@@ -1623,6 +1623,23 @@ function playScore() {
 document.getElementById('score-play').addEventListener('click', playScore);
 document.getElementById('score-stop').addEventListener('click', stopScorePlayback);
 
+// ---------- progress timer ----------
+let _progressTimer = null;
+function startProgress(label) {
+  const out = document.getElementById('output');
+  const t0 = Date.now();
+  out.textContent = label + ' (0秒)';
+  if (_progressTimer) clearInterval(_progressTimer);
+  _progressTimer = setInterval(() => {
+    const sec = Math.floor((Date.now() - t0) / 1000);
+    if (out.textContent.startsWith(label)) out.textContent = label + ' (' + sec + '秒)';
+    else clearInterval(_progressTimer);
+  }, 1000);
+}
+function stopProgress() {
+  if (_progressTimer) { clearInterval(_progressTimer); _progressTimer = null; }
+}
+
 // ---------- shared submit helper ----------
 async function postJSON(url, fd) {
   const res = await fetch(url, { method: 'POST', body: fd });
@@ -1648,7 +1665,7 @@ document.getElementById('general-form').addEventListener('submit', async (e) => 
   if (key) fd.append('key', key);
 
   setBusy(form, true);
-  document.getElementById('output').textContent = '送信中…';
+  startProgress('送信中');
   try {
     if (mode === 'fix') {
       const res = await fetch('/fix', { method: 'POST', body: fd });
@@ -1688,7 +1705,7 @@ document.getElementById('general-form').addEventListener('submit', async (e) => 
   } catch (err) {
     document.getElementById('output').textContent = 'エラー: ' + err.message;
   } finally {
-    setBusy(form, false);
+    stopProgress(); setBusy(form, false);
   }
 });
 
@@ -1826,7 +1843,7 @@ document.getElementById('lesson-form').addEventListener('submit', async (e) => {
   if (e.submitter.dataset.mode === 'check-llm') fd.append('use_llm', 'true');
 
   setBusy(form, true);
-  document.getElementById('output').textContent = '送信中…(lesson check)';
+  startProgress('送信中(レッスン)');
   document.getElementById('tutor').style.display = 'none';
   document.getElementById('tutor-heading').style.display = 'none';
 
@@ -1845,7 +1862,7 @@ document.getElementById('lesson-form').addEventListener('submit', async (e) => {
   } catch (err) {
     document.getElementById('output').textContent = 'エラー: ' + err.message;
   } finally {
-    setBusy(form, false);
+    stopProgress(); setBusy(form, false);
   }
 });
 
@@ -1869,7 +1886,7 @@ document.getElementById('species-form').addEventListener('submit', async (e) => 
   if (key) fd.append('key', key);
 
   setBusy(form, true);
-  document.getElementById('output').textContent = '送信中…(species check)';
+  startProgress('送信中(Species)');
   document.getElementById('tutor').style.display = 'none';
   document.getElementById('tutor-heading').style.display = 'none';
 
@@ -1888,7 +1905,7 @@ document.getElementById('species-form').addEventListener('submit', async (e) => 
   } catch (err) {
     document.getElementById('output').textContent = 'エラー: ' + err.message;
   } finally {
-    setBusy(form, false);
+    stopProgress(); setBusy(form, false);
   }
 });
 </script>
